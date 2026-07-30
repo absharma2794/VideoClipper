@@ -28,12 +28,15 @@ enum Clipper {
 
     enum ExportError: LocalizedError {
         case invalidRange
+        case cancelled
         case ffmpegFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .invalidRange:
                 return "The end time must be after the start time."
+            case .cancelled:
+                return "Export stopped."
             case .ffmpegFailed(let detail):
                 return "Export failed: \(detail)"
             }
@@ -54,7 +57,12 @@ enum Clipper {
 
         if request.precise {
             let args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL)
-            try await runFFmpeg(tools.ffmpeg, args, totalDuration: clipDuration, onProgress: onProgress)
+            do {
+                try await runFFmpeg(tools.ffmpeg, args, totalDuration: clipDuration, onProgress: onProgress)
+            } catch {
+                try? FileManager.default.removeItem(at: outputURL) // don't leave a partial/cancelled file behind
+                throw error
+            }
             return Result(outputURL: outputURL, usedAudioReencodeFallback: false)
         }
 
@@ -78,13 +86,25 @@ enum Clipper {
         do {
             try await runFFmpeg(tools.ffmpeg, copyArgs, totalDuration: copyDuration, onProgress: onProgress)
             return Result(outputURL: outputURL, usedAudioReencodeFallback: false)
+        } catch ExportError.cancelled {
+            // Never retry a user-requested stop -- just clean up and propagate.
+            try? FileManager.default.removeItem(at: outputURL)
+            throw ExportError.cancelled
         } catch {
             // Common on MP4 output when the source audio codec (e.g. AC-3, or MKV-only
             // codecs) isn't legal inside an MP4 container. Retry once with AAC audio.
-            guard request.format == .mp4 else { throw error }
+            guard request.format == .mp4 else {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw error
+            }
             try? FileManager.default.removeItem(at: outputURL) // clean up any partial output
             let fallbackArgs = fastCopyArguments(request: request, seekStart: seekStart, clipDuration: copyDuration, outputURL: outputURL, reencodeAudio: true)
-            try await runFFmpeg(tools.ffmpeg, fallbackArgs, totalDuration: copyDuration, onProgress: onProgress)
+            do {
+                try await runFFmpeg(tools.ffmpeg, fallbackArgs, totalDuration: copyDuration, onProgress: onProgress)
+            } catch {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw error
+            }
             return Result(outputURL: outputURL, usedAudioReencodeFallback: true)
         }
     }
@@ -228,56 +248,134 @@ enum Clipper {
         totalDuration: Double,
         onProgress: @escaping (Double) -> Void
     ) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
 
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
-            // Accumulate the stderr tail so a failure can be reported with a
-            // real reason instead of a bare exit code.
-            let stderrBuffer = StderrBuffer()
+        // Accumulate the stderr tail so a failure can be reported with a
+        // real reason instead of a bare exit code.
+        let stderrBuffer = StderrBuffer()
 
-            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                for line in text.split(separator: "\n") {
-                    if line.hasPrefix("out_time_us=") {
-                        let valueString = line.dropFirst("out_time_us=".count)
-                        if let microseconds = Double(valueString), totalDuration > 0 {
-                            let fraction = min(max(microseconds / 1_000_000 / totalDuration, 0), 1)
-                            onProgress(fraction)
-                        }
+        // ffmpeg traps SIGTERM and exits through its own "graceful shutdown"
+        // path (logging "Exiting normally, received signal 15" and a non-zero
+        // status) rather than dying from an uncaught signal -- so
+        // `Process.terminationReason` can't distinguish "we cancelled this"
+        // from "ffmpeg hit a real error". This flag is set by onCancel below
+        // right before terminate() is called, so the termination handler can
+        // tell the difference directly instead of guessing from the signal.
+        let cancelFlag = CancelFlag()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.split(separator: "\n") {
+                if line.hasPrefix("out_time_us=") {
+                    let valueString = line.dropFirst("out_time_us=".count)
+                    if let microseconds = Double(valueString), totalDuration > 0 {
+                        let fraction = min(max(microseconds / 1_000_000 / totalDuration, 0), 1)
+                        onProgress(fraction)
                     }
                 }
             }
-            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                stderrBuffer.append(text)
-            }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            stderrBuffer.append(text)
+        }
 
-            process.terminationHandler = { proc in
-                stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                stderrPipe.fileHandleForReading.readabilityHandler = nil
-                if proc.terminationStatus == 0 {
-                    onProgress(1.0)
-                    continuation.resume(returning: ())
-                } else {
-                    let tail = stderrBuffer.tail(lines: 8)
-                    continuation.resume(throwing: ExportError.ffmpegFailed(tail.isEmpty ? "exit code \(proc.terminationStatus)" : tail))
+        // Registered with RunningExports so a Force Stop click (which cancels
+        // the enclosing Task, triggering onCancel below) and an app-quit
+        // safety net (RunningExports.terminateAll(), called from the app
+        // delegate) both have a handle to actually kill the child process.
+        // Without this, quitting the app left ffmpeg orphaned and still
+        // writing to the output file in the background -- exactly the stuck
+        // export that prompted this feature, and the two ffmpeg processes it
+        // can produce (an old orphan plus a freshly started one, both writing
+        // to the same path) is enough to corrupt the output outright.
+        try await withTaskCancellationHandler(
+            operation: {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    process.terminationHandler = { proc in
+                        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                        stderrPipe.fileHandleForReading.readabilityHandler = nil
+                        RunningExports.shared.unregister(process)
+                        if proc.terminationStatus == 0 {
+                            onProgress(1.0)
+                            continuation.resume(returning: ())
+                        } else if cancelFlag.isSet {
+                            continuation.resume(throwing: ExportError.cancelled)
+                        } else {
+                            let tail = stderrBuffer.tail(lines: 8)
+                            continuation.resume(throwing: ExportError.ffmpegFailed(tail.isEmpty ? "exit code \(proc.terminationStatus)" : tail))
+                        }
+                    }
+
+                    do {
+                        try process.run()
+                        RunningExports.shared.register(process)
+                    } catch {
+                        continuation.resume(throwing: ExportError.ffmpegFailed(error.localizedDescription))
+                    }
                 }
+            },
+            onCancel: {
+                cancelFlag.set()
+                process.terminate()
             }
+        )
+    }
+}
 
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: ExportError.ffmpegFailed(error.localizedDescription))
-            }
+/// Thread-safe one-shot flag: set once, from whichever thread cancels the task.
+private final class CancelFlag: @unchecked Sendable {
+    private var flag = false
+    private let lock = NSLock()
+
+    func set() {
+        lock.lock(); defer { lock.unlock() }
+        flag = true
+    }
+
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return flag
+    }
+}
+
+/// Tracks currently-running ffmpeg export processes so they can be force-killed
+/// -- either cooperatively (Force Stop cancels the Task, which signals the
+/// process via `runFFmpeg`'s cancellation handler) or as a hard safety net when
+/// the app itself is quitting, so no export is ever left running as an orphan
+/// after the app closes.
+final class RunningExports: @unchecked Sendable {
+    static let shared = RunningExports()
+    private init() {}
+
+    private var active: [ObjectIdentifier: Process] = [:]
+    private let lock = NSLock()
+
+    func register(_ process: Process) {
+        lock.lock(); defer { lock.unlock() }
+        active[ObjectIdentifier(process)] = process
+    }
+
+    func unregister(_ process: Process) {
+        lock.lock(); defer { lock.unlock() }
+        active.removeValue(forKey: ObjectIdentifier(process))
+    }
+
+    func terminateAll() {
+        lock.lock()
+        let processes = Array(active.values)
+        lock.unlock()
+        for process in processes where process.isRunning {
+            process.terminate()
         }
     }
 }

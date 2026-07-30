@@ -21,6 +21,7 @@ struct EditorView: View {
     @State private var progress: Double = 0
     @State private var exportResult: Clipper.Result?
     @State private var errorMessage: String?
+    @State private var exportTask: Task<Void, Never>?
 
     init(sourceURL: URL, info: VideoProbe.Info, tools: FFmpegLocator.Tools, onChooseDifferentFile: @escaping () -> Void) {
         self.sourceURL = sourceURL
@@ -89,12 +90,16 @@ struct EditorView: View {
             }
 
             if isExporting {
-                VStack(alignment: .center, spacing: 6) {
+                VStack(alignment: .center, spacing: 8) {
                     ProgressView(value: progress)
                         .frame(maxWidth: 320)
                     Text(precise ? "Re-encoding… \(Int(progress * 100))%" : "Exporting… \(Int(progress * 100))%")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Button("Force Stop", role: .destructive) {
+                        exportTask?.cancel()
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
 
@@ -170,7 +175,7 @@ struct EditorView: View {
 
         let request = Clipper.Request(sourceURL: sourceURL, start: start, end: end, format: format, precise: precise)
 
-        Task {
+        exportTask = Task {
             do {
                 let result = try await Clipper.export(request, tools: tools) { fraction in
                     Task { @MainActor in
