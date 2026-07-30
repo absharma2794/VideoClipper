@@ -16,6 +16,8 @@ struct EditorView: View {
     @State private var endDigits: String
     @State private var format: Clipper.OutputFormat = .mkv
     @State private var precise = false
+    @State private var qualityTier: Clipper.QualityTier = .same
+    @State private var resolution: Clipper.Resolution = .native
 
     @State private var isExporting = false
     @State private var progress: Double = 0
@@ -82,6 +84,10 @@ struct EditorView: View {
                 Toggle("Precise cut (re-encodes, slower)", isOn: $precise)
             }
 
+            if precise {
+                preciseOptionsView
+            }
+
             if let validationMessage, !isExporting {
                 Text(validationMessage)
                     .font(.caption)
@@ -132,6 +138,40 @@ struct EditorView: View {
         .frame(maxWidth: .infinity)
     }
 
+    private var availableResolutions: [Clipper.Resolution] {
+        Clipper.Resolution.availableOptions(sourceHeight: info.height)
+    }
+
+    private var preciseOptionsView: some View {
+        VStack(spacing: 6) {
+            Picker("Quality", selection: $qualityTier) {
+                ForEach(Clipper.QualityTier.allCases) { tier in
+                    Text(tier.displayName).tag(tier)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 340)
+
+            HStack(spacing: 8) {
+                Text("Resolution")
+                Picker("Resolution", selection: $resolution) {
+                    ForEach(availableResolutions) { option in
+                        Text(option.displayName).tag(option)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 140)
+
+                if info.width > 0, info.height > 0 {
+                    Text("Current: \(info.width)×\(info.height)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .disabled(isExporting)
+    }
+
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "film.fill").foregroundStyle(.secondary)
@@ -173,7 +213,10 @@ struct EditorView: View {
         progress = 0
         isExporting = true
 
-        let request = Clipper.Request(sourceURL: sourceURL, start: start, end: end, format: format, precise: precise)
+        let request = Clipper.Request(
+            sourceURL: sourceURL, sourceInfo: info, start: start, end: end, format: format,
+            precise: precise, qualityTier: qualityTier, resolution: resolution
+        )
 
         exportTask = Task {
             do {

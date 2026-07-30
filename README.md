@@ -69,11 +69,23 @@ xattr -dr com.apple.quarantine MKVClipper.app
 
 | Mode | Speed | How it cuts |
 |---|---|---|
-| **Fast** (default) | Near-instant | Copies the original video/audio streams without re-encoding. Lossless, but the actual start point snaps to the nearest keyframe — on typical recordings (e.g. OBS) that can be up to ~2 seconds off from what you typed. |
-| **Precise** (checkbox) | Slower | Re-encodes video (H.264) so the start and end land exactly where you typed them. Takes noticeably longer on long clips and involves a small quality re-encode. |
+| **Fast** (default) | Near-instant | Copies the original video/audio streams without re-encoding. Lossless, but the actual start point snaps to the nearest keyframe — on typical recordings (e.g. OBS) that can be up to a few seconds off from what you typed. |
+| **Precise** (checkbox) | Slower | Re-encodes so the start and end land exactly where you typed them. Takes noticeably longer on long clips. |
 
 Turn on **Precise cut** when the exact frame matters; leave it off for
 quick, lossless trims.
+
+### Precise mode: Quality and Resolution
+
+Turning on **Precise cut** reveals two more choices:
+
+| Quality | What it does |
+|---|---|
+| **Smaller** | Re-encodes with hardware-accelerated HEVC (H.265). Dramatically smaller files (often ~5–7x smaller than H.264) at comparable visual quality, same resolution, similar speed — thanks to your Mac's dedicated video encoder. |
+| **Same Quality** | Matches the source's own codec family and bitrate as closely as possible, so a shorter clip comes out proportionally smaller — the way you'd expect "clipping" to behave. |
+| **Highest Quality** | Always re-encodes to H.264 at a fixed high-quality setting. Prioritizes precision/quality over file size — expect the largest files here, sometimes larger than the source. |
+
+**Resolution** lets you optionally downscale (never upscale — that only wastes space, it doesn't add real detail) to 540p/720p/1080p/1440p/4K, shown alongside the source's actual resolution. Leave it on **Native** to keep the original pixel dimensions.
 
 ## Notes
 

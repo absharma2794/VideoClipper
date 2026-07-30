@@ -6,6 +6,14 @@ enum VideoProbe {
     struct Info {
         let durationSeconds: Double
         let hasAudio: Bool
+        let width: Int
+        let height: Int
+        let videoCodec: String
+        /// Video-stream bitrate in bits/sec, when the container declares one.
+        /// Used to target a "Same quality" re-encode at roughly the source's
+        /// own efficiency. Not all containers report this (notably some MKVs),
+        /// so callers must handle nil.
+        let videoBitrate: Int?
     }
 
     enum ProbeError: LocalizedError {
@@ -61,7 +69,45 @@ enum VideoProbe {
         )
         let hasAudio = !audioOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-        return Info(durationSeconds: duration, hasAudio: hasAudio)
+        // key=value lines (default=noprint_wrappers=1) parse robustly regardless
+        // of which fields are actually present -- some containers omit bit_rate.
+        let videoOutput = try await run(
+            executable: ffprobePath,
+            arguments: [
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,codec_name,bit_rate",
+                "-of", "default=noprint_wrappers=1",
+                url.path,
+            ]
+        )
+        var videoFields: [String: String] = [:]
+        for line in videoOutput.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            videoFields[String(parts[0])] = String(parts[1])
+        }
+        let width = Int(videoFields["width"] ?? "") ?? 0
+        let height = Int(videoFields["height"] ?? "") ?? 0
+        let videoCodec = videoFields["codec_name"] ?? "unknown"
+        var videoBitrate = Int(videoFields["bit_rate"] ?? "")
+
+        // Some containers (notably several MKVs) don't declare a per-stream
+        // bit_rate; fall back to the container-level bit_rate as an estimate.
+        if videoBitrate == nil {
+            let formatBitrateOutput = try? await run(
+                executable: ffprobePath,
+                arguments: [
+                    "-v", "error",
+                    "-show_entries", "format=bit_rate",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    url.path,
+                ]
+            )
+            videoBitrate = Int(formatBitrateOutput?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        }
+
+        return Info(durationSeconds: duration, hasAudio: hasAudio, width: width, height: height, videoCodec: videoCodec, videoBitrate: videoBitrate)
     }
 
     // MARK: - ffmpeg fallback (parses stderr banner when ffprobe is unavailable)
@@ -82,7 +128,8 @@ enum VideoProbe {
             throw ProbeError.durationNotFound
         }
         let hasAudio = text.contains("Stream #") && text.contains("Audio:")
-        return Info(durationSeconds: duration, hasAudio: hasAudio)
+        let (width, height, videoCodec, videoBitrate) = parseVideoStreamInfo(from: text)
+        return Info(durationSeconds: duration, hasAudio: hasAudio, width: width, height: height, videoCodec: videoCodec, videoBitrate: videoBitrate)
     }
 
     /// Parses a line like: `  Duration: 00:12:34.56, start: 0.000000, bitrate: 1234 kb/s`
@@ -93,6 +140,39 @@ enum VideoProbe {
         let timeString = String(afterLabel[afterLabel.startIndex..<commaRange.lowerBound])
         if timeString.contains("N/A") { return nil }
         return Timecode.parse(timeString)
+    }
+
+    /// Parses a line like:
+    /// `  Stream #0:0[0x1](und): Video: hevc (Main) ..., yuv420p(tv, bt709), 3840x2160 [SAR 1:1 DAR 16:9], 10295 kb/s, 23.98 fps, ...`
+    private static func parseVideoStreamInfo(from ffmpegOutput: String) -> (width: Int, height: Int, codec: String, bitrate: Int?) {
+        for line in ffmpegOutput.split(separator: "\n") {
+            guard line.contains("Video:") else { continue }
+            let codec = line
+                .components(separatedBy: "Video: ").last?
+                .split(separator: " ").first
+                .map(String.init) ?? "unknown"
+
+            var width = 0, height = 0
+            for token in line.split(separator: " ") {
+                let cleaned = token.trimmingCharacters(in: CharacterSet(charactersIn: ",[]"))
+                let parts = cleaned.split(separator: "x")
+                if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
+                    width = w; height = h
+                    break
+                }
+            }
+
+            var bitrate: Int?
+            if let range = line.range(of: " kb/s") {
+                let beforeUnit = line[..<range.lowerBound]
+                if let comma = beforeUnit.range(of: ",", options: .backwards) {
+                    let numberText = beforeUnit[comma.upperBound...].trimmingCharacters(in: .whitespaces)
+                    if let kbps = Int(numberText) { bitrate = kbps * 1000 }
+                }
+            }
+            return (width, height, codec, bitrate)
+        }
+        return (0, 0, "unknown", nil)
     }
 
     // MARK: - Process execution
