@@ -1,0 +1,4 @@
+MKVClipper.app/
+*.dSYM/
+.DS_Store
+.build/

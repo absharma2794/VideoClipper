@@ -1,0 +1,86 @@
+import SwiftUI
+import UniformTypeIdentifiers
+import AppKit
+
+/// The initial screen: a drag-and-drop target for a single .mkv file,
+/// plus a conventional "Choose File…" button for anyone who'd rather not drag.
+struct DropZoneView: View {
+    let onFilePicked: (URL) -> Void
+
+    @State private var isTargeted = false
+    @State private var rejectionMessage: String?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "film")
+                .font(.system(size: 44))
+                .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
+
+            Text("Drop an .mkv file here")
+                .font(.title3).bold()
+
+            Text("or")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button("Choose File…", action: presentOpenPanel)
+                .buttonStyle(.bordered)
+
+            if let rejectionMessage {
+                Text(rejectionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [8]))
+                .foregroundStyle(isTargeted ? Color.accentColor : Color.gray.opacity(0.4))
+                .padding(20)
+        )
+        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            handleDrop(providers: providers)
+        }
+    }
+
+    private func presentOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        // UTType for Matroska isn't reliably registered system-wide, so filter
+        // by extension rather than a UTType the panel might not recognize.
+        panel.allowedContentTypes = []
+        if panel.runModal() == .OK, let url = panel.url {
+            accept(url: url)
+        }
+    }
+
+    private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            rejectionMessage = "That didn't look like a file."
+            return false
+        }
+        _ = provider.loadObject(ofClass: URL.self) { url, error in
+            DispatchQueue.main.async {
+                guard let url, error == nil else {
+                    self.rejectionMessage = "Couldn't read that item."
+                    return
+                }
+                self.accept(url: url)
+            }
+        }
+        return true
+    }
+
+    private func accept(url: URL) {
+        guard url.pathExtension.lowercased() == "mkv" else {
+            rejectionMessage = "\"\(url.lastPathComponent)\" isn't an .mkv file."
+            return
+        }
+        rejectionMessage = nil
+        onFilePicked(url)
+    }
+}
