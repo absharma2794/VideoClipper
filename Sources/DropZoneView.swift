@@ -2,10 +2,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
-/// The initial screen: a drag-and-drop target for a single .mkv file,
-/// plus a conventional "Choose File…" button for anyone who'd rather not drag.
+/// The initial screen: a drag-and-drop target for a single .mkv or .mp4 file,
+/// plus conventional buttons for anyone who'd rather not drag.
 struct DropZoneView: View {
     let onFilePicked: (URL) -> Void
+
+    private static let supportedExtensions: Set<String> = ["mkv", "mp4"]
 
     @State private var isTargeted = false
     @State private var rejectionMessage: String?
@@ -25,6 +27,9 @@ struct DropZoneView: View {
 
             Button("Choose File…", action: presentOpenPanel)
                 .buttonStyle(.bordered)
+
+            Button("I know you have a .mp4 file", action: presentOpenPanel)
+                .buttonStyle(.link)
 
             if let rejectionMessage {
                 Text(rejectionMessage)
@@ -76,8 +81,8 @@ struct DropZoneView: View {
     }
 
     private func accept(url: URL) {
-        guard url.pathExtension.lowercased() == "mkv" else {
-            rejectionMessage = "\"\(url.lastPathComponent)\" isn't an .mkv file."
+        guard Self.supportedExtensions.contains(url.pathExtension.lowercased()) else {
+            rejectionMessage = "\"\(url.lastPathComponent)\" isn't an .mkv or .mp4 file."
             return
         }
         rejectionMessage = nil

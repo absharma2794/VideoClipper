@@ -1,8 +1,8 @@
 # MKV Clipper
 
-A tiny, single-purpose macOS app: drag in an `.mkv` file, type a start and
-end time, hit **Export**, get a clipped file in `~/Downloads`. No timeline,
-no filters, no re-encoding unless you ask for it.
+A tiny, single-purpose macOS app: drag in an `.mkv` (or `.mp4`) file, type a
+start and end time, hit **Export**, get a clipped file in `~/Downloads`. No
+timeline, no filters, no re-encoding unless you ask for it.
 
 Built for personal use and distributed only via this GitHub repo — it is
 not notarized or App Store–signed.
@@ -57,7 +57,8 @@ xattr -dr com.apple.quarantine MKVClipper.app
 
 ## Using it
 
-1. Drag an `.mkv` onto the window (or click **Choose File…**).
+1. Drag an `.mkv` or `.mp4` onto the window (or click **Choose File…**, or
+   the **I know you have a .mp4 file** link if that's what you've got).
 2. The total duration appears automatically.
 3. Type a **Start** and **End** time as `HH:MM:SS`.
 4. Pick an output format — MKV or MP4.
