@@ -90,15 +90,19 @@ enum Clipper {
     }
 
     /// Finds the timestamp of the last video keyframe at or before `target`,
-    /// by asking ffprobe for the (typically short) list of keyframe packets.
-    /// Falls back to `target` unmodified if ffprobe isn't available or the
-    /// lookup fails -- fast-copy exports may then overshoot the requested
-    /// end on sparse-keyframe sources, but the app still functions with
-    /// ffmpeg alone.
+    /// by asking ffprobe for the list of keyframe packets. `-read_intervals`
+    /// bounds ffprobe to scanning only `[0, target]` -- without it, ffprobe
+    /// demuxes the *entire* file just to list packets, which is needlessly
+    /// slow (and was measured to effectively hang on a real ~12-minute MP4
+    /// recording). Falls back to `target` unmodified if ffprobe isn't
+    /// available or the lookup fails -- fast-copy exports may then overshoot
+    /// the requested end on sparse-keyframe sources, but the app still
+    /// functions with ffmpeg alone.
     private static func nearestKeyframeTimestamp(atOrBefore target: Double, sourceURL: URL, tools: FFmpegLocator.Tools) async -> Double {
         guard target > 0, let ffprobePath = tools.ffprobe else { return max(target, 0) }
         let arguments = [
             "-v", "error",
+            "-read_intervals", "%\(target)",
             "-select_streams", "v:0",
             "-show_entries", "packet=pts_time,flags",
             "-of", "csv=p=0",
@@ -109,15 +113,17 @@ enum Clipper {
         var best = 0.0
         for line in output.split(separator: "\n") {
             let fields = line.split(separator: ",")
-            guard fields.count == 2, fields[1].contains("K"), let pts = Double(fields[0]) else { continue }
-            if pts > target { break } // packets are emitted in increasing pts order
+            guard fields.count == 2, fields[1].contains("K"), let pts = Double(fields[0]), pts <= target else { continue }
             best = pts
         }
         return best
     }
 
-    /// Runs a process to completion and returns its combined stdout, without
-    /// progress tracking -- used for the lightweight keyframe-list lookup above.
+    /// Runs a process to completion and returns its combined stdout.
+    /// Reads incrementally as data arrives (rather than waiting for the
+    /// process to exit and reading once) -- pipes have a small kernel buffer,
+    /// and a process producing more output than that buffer will block on
+    /// `write()` forever if nothing drains the pipe while it's still running.
     private static func runCapture(_ executable: String, _ arguments: [String]) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             let process = Process()
@@ -126,10 +132,20 @@ enum Clipper {
             let stdoutPipe = Pipe()
             process.standardOutput = stdoutPipe
             process.standardError = Pipe()
-            process.terminationHandler = { proc in
-                let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: String(data: data, encoding: .utf8) ?? "")
+
+            let outputBuffer = UnboundedOutputBuffer()
+
+            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                outputBuffer.append(text)
             }
+
+            process.terminationHandler = { proc in
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                continuation.resume(returning: outputBuffer.contents)
+            }
+
             do {
                 try process.run()
             } catch {
@@ -285,5 +301,25 @@ private final class StderrBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return lines.suffix(count).joined(separator: "\n")
+    }
+}
+
+/// Thread-safe, untruncated accumulator for a process's full stdout --
+/// used where every line of output is meaningful (e.g. a keyframe list),
+/// unlike `StderrBuffer` which intentionally keeps only a diagnostic tail.
+private final class UnboundedOutputBuffer: @unchecked Sendable {
+    private var text = ""
+    private let lock = NSLock()
+
+    func append(_ chunk: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        text += chunk
+    }
+
+    var contents: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
     }
 }

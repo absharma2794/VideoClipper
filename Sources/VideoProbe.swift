@@ -109,11 +109,30 @@ enum VideoProbe {
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
+            // Read incrementally as data arrives rather than waiting for the
+            // process to exit and reading once -- a pipe's kernel buffer is
+            // only ~64KB, and a process producing more output than that
+            // (e.g. ffprobe listing many streams/chapters) would otherwise
+            // block on write() forever with nothing draining the pipe.
+            let stdoutBuffer = UnboundedTextBuffer()
+            let stderrBuffer = UnboundedTextBuffer()
+
+            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                stdoutBuffer.append(text)
+            }
+            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                stderrBuffer.append(text)
+            }
+
             process.terminationHandler = { proc in
-                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
-                let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+                let stdoutText = stdoutBuffer.contents
+                let stderrText = stderrBuffer.contents
 
                 if proc.terminationStatus != 0 && !allowNonZeroExit {
                     let detail = stderrText.isEmpty ? "exit code \(proc.terminationStatus)" : stderrText
@@ -130,5 +149,24 @@ enum VideoProbe {
                 continuation.resume(throwing: ProbeError.processFailed(error.localizedDescription))
             }
         }
+    }
+}
+
+/// Thread-safe, untruncated accumulator for a process's stdout/stderr,
+/// filled incrementally so reading never stalls behind a full pipe buffer.
+private final class UnboundedTextBuffer: @unchecked Sendable {
+    private var text = ""
+    private let lock = NSLock()
+
+    func append(_ chunk: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        text += chunk
+    }
+
+    var contents: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
     }
 }
