@@ -1,7 +1,7 @@
 import Foundation
 
 /// Drives ffmpeg to cut `[start, end)` out of a source video and write the
-/// result to ~/Downloads.
+/// result to ~/Downloads/MKV Clipper Exports.
 enum Clipper {
 
     enum OutputFormat: String, CaseIterable, Identifiable {
@@ -74,6 +74,11 @@ enum Clipper {
         let precise: Bool
         var qualityTier: QualityTier = .same
         var resolution: Resolution = .native
+        /// Where the clip is written. `nil` means the general exports folder
+        /// (`~/Downloads/MKV Clipper Exports`); `exportBatch` sets this to a
+        /// shared per-session subfolder so every clip in a Bulk Clip run lands
+        /// together.
+        var outputDirectory: URL?
     }
 
     struct Result {
@@ -110,7 +115,8 @@ enum Clipper {
         let clipDuration = request.end - request.start
         guard clipDuration > 0 else { throw ExportError.invalidRange }
 
-        let outputURL = try uniqueOutputURL(for: request.sourceURL, start: request.start, end: request.end, format: request.format)
+        let directory = try request.outputDirectory ?? exportsBaseFolder()
+        let outputURL = try uniqueOutputURL(in: directory, for: request.sourceURL, start: request.start, end: request.end, format: request.format)
 
         if request.precise {
             let args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL)
@@ -177,14 +183,23 @@ enum Clipper {
     /// accumulate across many intervals -- important since this same function
     /// drives both the UI's live clip-count preview and the actual export loop,
     /// and the two must never disagree.
-    static func splitIntoIntervals(rangeStart: Double, rangeEnd: Double, intervalSeconds: Double) -> [(start: Double, end: Double)] {
+    ///
+    /// `bufferSeconds` (default 0, today's exact behavior) pulls every clip's
+    /// start back by that much *except the first clip*, so consecutive clips
+    /// overlap and nothing right at a cut boundary gets lost. Only the start
+    /// moves -- ends stay at the normal boundaries, so the last clip still
+    /// stops exactly at `rangeEnd` rather than reaching past footage that
+    /// doesn't exist. A buffered start is clamped to never precede `rangeStart`.
+    static func splitIntoIntervals(rangeStart: Double, rangeEnd: Double, intervalSeconds: Double, bufferSeconds: Double = 0) -> [(start: Double, end: Double)] {
         guard intervalSeconds > 0, rangeEnd > rangeStart else { return [] }
         var result: [(start: Double, end: Double)] = []
         var index = 0
         while true {
-            let start = rangeStart + Double(index) * intervalSeconds
-            if start >= rangeEnd { break }
-            result.append((start: start, end: min(start + intervalSeconds, rangeEnd)))
+            let normalStart = rangeStart + Double(index) * intervalSeconds
+            if normalStart >= rangeEnd { break }
+            let end = min(normalStart + intervalSeconds, rangeEnd)
+            let start = index == 0 ? normalStart : max(rangeStart, normalStart - bufferSeconds)
+            result.append((start: start, end: end))
             index += 1
         }
         return result
@@ -224,6 +239,14 @@ enum Clipper {
         tools: FFmpegLocator.Tools,
         onProgress: @escaping (_ completedClips: Int, _ totalClips: Int, _ currentClipFraction: Double) -> Void
     ) async throws -> [URL] {
+        // One subfolder per session, named after the source file, resolved once
+        // up front so every clip in this run lands together rather than loose
+        // in the general exports folder.
+        let sessionFolder = try uniqueExportSubfolder(
+            named: sourceURL.deletingPathExtension().lastPathComponent,
+            in: exportsBaseFolder()
+        )
+
         var outputURLs: [URL] = []
         for (index, interval) in intervals.enumerated() {
             do {
@@ -234,7 +257,8 @@ enum Clipper {
 
             let request = Request(
                 sourceURL: sourceURL, sourceInfo: sourceInfo, start: interval.start, end: interval.end,
-                format: format, precise: true, qualityTier: qualityTier, resolution: resolution
+                format: format, precise: true, qualityTier: qualityTier, resolution: resolution,
+                outputDirectory: sessionFolder
             )
             do {
                 let result = try await export(request, tools: tools) { fraction in
@@ -425,19 +449,45 @@ enum Clipper {
 
     // MARK: - Output path
 
-    /// Builds `~/Downloads/<basename>_clip_<start>-<end>.<ext>`, appending
-    /// " (2)", " (3)", ... on collision so an existing file is never overwritten.
-    private static func uniqueOutputURL(for sourceURL: URL, start: Double, end: Double, format: OutputFormat) throws -> URL {
+    /// `~/Downloads/MKV Clipper Exports` -- the general home for every export
+    /// this app produces, created on first use. Replaces writing straight
+    /// into `~/Downloads`, which got cluttered fast once Bulk Clip sessions
+    /// could drop dozens of files there at once.
+    static func exportsBaseFolder() throws -> URL {
         let downloads = try FileManager.default.url(
             for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: true
         )
+        let folder = downloads.appendingPathComponent("MKV Clipper Exports")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    /// A per-Bulk-Clip-session folder inside `exportsBaseFolder()`, named
+    /// after the source file so a session's many same-named-but-different-
+    /// timestamp clips stay together instead of loose in the general folder.
+    /// " (2)", " (3)", ... on collision, same pattern as `uniqueOutputURL`
+    /// below, so two sessions on the same source never mix their clips.
+    static func uniqueExportSubfolder(named base: String, in parent: URL) throws -> URL {
+        var candidate = parent.appendingPathComponent(base)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = parent.appendingPathComponent("\(base) (\(suffix))")
+            suffix += 1
+        }
+        try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
+        return candidate
+    }
+
+    /// Builds `<directory>/<basename>_clip_<start>-<end>.<ext>`, appending
+    /// " (2)", " (3)", ... on collision so an existing file is never overwritten.
+    private static func uniqueOutputURL(in directory: URL, for sourceURL: URL, start: Double, end: Double, format: OutputFormat) throws -> URL {
         let base = sourceURL.deletingPathExtension().lastPathComponent
         let stem = "\(base)_clip_\(Timecode.filenameSafe(start))-\(Timecode.filenameSafe(end))"
 
-        var candidate = downloads.appendingPathComponent(stem).appendingPathExtension(format.rawValue)
+        var candidate = directory.appendingPathComponent(stem).appendingPathExtension(format.rawValue)
         var suffix = 2
         while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = downloads.appendingPathComponent("\(stem) (\(suffix))").appendingPathExtension(format.rawValue)
+            candidate = directory.appendingPathComponent("\(stem) (\(suffix))").appendingPathExtension(format.rawValue)
             suffix += 1
         }
         return candidate

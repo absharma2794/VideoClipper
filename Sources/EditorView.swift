@@ -27,6 +27,9 @@ struct EditorView: View {
 
     @State private var intervalDigits = "30"
     @State private var intervalUnit: IntervalUnit = .seconds
+    /// Seconds only, per request -- no unit picker for this one. "0" (the
+    /// default) means no buffer, identical to today's behavior.
+    @State private var bufferDigits = "0"
 
     @State private var isExporting = false
     @State private var progress: Double = 0
@@ -62,10 +65,14 @@ struct EditorView: View {
         return Double(count) * (intervalUnit == .minutes ? 60 : 1)
     }
 
+    private var bufferSeconds: Double {
+        Double(bufferDigits) ?? 0
+    }
+
     private var plannedIntervals: [(start: Double, end: Double)] {
         guard mode == .split, let start = parsedStart, let end = parsedEnd, end > start,
               let interval = intervalSeconds else { return [] }
-        return Clipper.splitIntoIntervals(rangeStart: start, rangeEnd: end, intervalSeconds: interval)
+        return Clipper.splitIntoIntervals(rangeStart: start, rangeEnd: end, intervalSeconds: interval, bufferSeconds: bufferSeconds)
     }
 
     private var splitPreviewText: String? {
@@ -73,8 +80,15 @@ struct EditorView: View {
         guard !intervals.isEmpty, let interval = intervalSeconds else { return nil }
         let count = intervals.count
         var text = "→ \(count) clip\(count == 1 ? "" : "s")"
-        if let last = intervals.last, last.end - last.start < interval - 0.001 {
-            text += " (last clip: \(Int((last.end - last.start).rounded()))s)"
+        var notes: [String] = []
+        if bufferSeconds > 0 && count > 1 {
+            notes.append("clip 2 onward include a \(Int(bufferSeconds.rounded()))s buffer")
+        }
+        if let last = intervals.last, (last.end - last.start) < interval - 0.001 {
+            notes.append("last clip: \(Int((last.end - last.start).rounded()))s")
+        }
+        if !notes.isEmpty {
+            text += " (\(notes.joined(separator: ", ")))"
         }
         return text
     }
@@ -273,6 +287,10 @@ struct EditorView: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .frame(width: 160)
+
+                Text("Buffer")
+                IntervalField(digits: $bufferDigits, disabled: isExporting)
+                Text("sec").font(.caption).foregroundStyle(.secondary)
             }
             if let splitPreviewText {
                 Text(splitPreviewText)
@@ -318,13 +336,19 @@ struct EditorView: View {
     }
 
     private func batchResultBanner(_ urls: [URL]) -> some View {
-        HStack {
-            Label("\(urls.count) clip\(urls.count == 1 ? "" : "s") saved to ~/Downloads", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+        let sessionFolder = urls.first?.deletingLastPathComponent()
+        let folderName = sessionFolder?.lastPathComponent
+        return HStack {
+            Label(
+                "\(urls.count) clip\(urls.count == 1 ? "" : "s") saved" + (folderName.map { " to \"\($0)\"" } ?? ""),
+                systemImage: "checkmark.circle.fill"
+            )
+            .foregroundStyle(.green)
+            .lineLimit(2)
             Spacer(minLength: 12)
             Button("Reveal in Finder") {
-                if let downloads = try? FileManager.default.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
-                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: downloads.path)
+                if let sessionFolder {
+                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: sessionFolder.path)
                 }
             }
             .buttonStyle(.bordered)

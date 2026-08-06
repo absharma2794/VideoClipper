@@ -1,8 +1,9 @@
 # MKV Clipper
 
 A tiny, single-purpose macOS app: drag in an `.mkv` (or `.mp4`) file, type a
-start and end time, hit **Export**, get a clipped file in `~/Downloads`. No
-timeline, no filters, no re-encoding unless you ask for it.
+start and end time, hit **Export**, get a clipped file in
+`~/Downloads/MKV Clipper Exports`. No timeline, no filters, no re-encoding
+unless you ask for it.
 
 Built for personal use and distributed only via this GitHub repo — it is
 not notarized or App Store–signed.
@@ -62,8 +63,8 @@ xattr -dr com.apple.quarantine MKVClipper.app
 2. The total duration appears automatically.
 3. Type a **Start** and **End** time as `HH:MM:SS`.
 4. Pick an output format — MKV or MP4.
-5. Hit **Export**. The clip lands in `~/Downloads` and Finder can reveal it
-   for you.
+5. Hit **Export**. The clip lands in `~/Downloads/MKV Clipper Exports` and
+   Finder can reveal it for you.
 
 ### Fast vs. Precise cuts
 
@@ -103,9 +104,20 @@ many fixed-length clips automatically — e.g. a 1-hour video into
   isn't a choice here: Fast mode's keyframe-snapped start, fine for one clip,
   would misalign every clip boundary in a batch.) Quality and Resolution
   work the same as in Precise mode above.
-- Clips land in `~/Downloads`, named with their own time range (same scheme
-  as single-clip exports), so **Reveal in Finder** opens the folder rather
-  than one file.
+- **Buffer (seconds)** is optional and defaults to `0`. When set, every clip
+  *except the first* starts that many seconds earlier than its exact
+  boundary, so consecutive clips overlap slightly instead of cutting apart
+  cleanly — useful if you don't want to lose context right at a cut. Example:
+  a 1-minute video split into 6×10s clips with a 1s buffer gives clip 1 at
+  10s, and clips 2–6 at 11s each (only the start moves back; the last clip
+  still ends exactly at the end of your range, not past it).
+- Each Bulk Clip run gets its own folder, named after the source file, inside
+  the general exports folder — e.g. `~/Downloads/MKV Clipper
+  Exports/vacation/` for a run on `vacation.mkv`, keeping one session's
+  many same-named-but-different-timestamp clips together and out of the
+  general folder. Running Bulk Clip again on the same file creates
+  `vacation (2)/` rather than mixing with the first run. **Reveal in
+  Finder** opens that session's actual folder.
 - **Force Stop** stops the whole batch — the clip in progress is killed and
   its partial file removed; clips already finished are left in place.
 
