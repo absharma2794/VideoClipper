@@ -1,17 +1,23 @@
 import SwiftUI
 import AppKit
 
-/// The main editing screen: shows the loaded file's duration, lets the user
-/// type a start/end time, pick an output format, optionally request a
-/// precise (re-encoded) cut, and export.
+/// The main editing screen: shows the loaded file's duration, and offers two
+/// modes -- a single Start/End clip, or splitting a range into many
+/// equal-length clips at a fixed interval.
 struct EditorView: View {
     let sourceURL: URL
     let info: VideoProbe.Info
     let tools: FFmpegLocator.Tools
     let onChooseDifferentFile: () -> Void
 
+    private enum EditMode { case single, split }
+    private enum IntervalUnit { case seconds, minutes }
+
+    @State private var mode: EditMode = .single
+
     /// Raw digits only (up to 6, "HHMMSS") -- TimecodeField is the only thing
-    /// that writes to these, and it strips everything but digits.
+    /// that writes to these, and it strips everything but digits. In Split
+    /// mode these define the *range* to split, not a single clip.
     @State private var startDigits = "000000"
     @State private var endDigits: String
     @State private var format: Clipper.OutputFormat = .mkv
@@ -19,11 +25,18 @@ struct EditorView: View {
     @State private var qualityTier: Clipper.QualityTier = .same
     @State private var resolution: Clipper.Resolution = .native
 
+    @State private var intervalDigits = "30"
+    @State private var intervalUnit: IntervalUnit = .seconds
+
     @State private var isExporting = false
     @State private var progress: Double = 0
     @State private var exportResult: Clipper.Result?
     @State private var errorMessage: String?
     @State private var exportTask: Task<Void, Never>?
+
+    @State private var batchCompletedClips = 0
+    @State private var batchTotalClips = 0
+    @State private var batchResultURLs: [URL]?
 
     init(sourceURL: URL, info: VideoProbe.Info, tools: FFmpegLocator.Tools, onChooseDifferentFile: @escaping () -> Void) {
         self.sourceURL = sourceURL
@@ -44,6 +57,28 @@ struct EditorView: View {
         return Timecode.parse("\(hh):\(mm):\(ss)")
     }
 
+    private var intervalSeconds: Double? {
+        guard let count = Int(intervalDigits), count > 0 else { return nil }
+        return Double(count) * (intervalUnit == .minutes ? 60 : 1)
+    }
+
+    private var plannedIntervals: [(start: Double, end: Double)] {
+        guard mode == .split, let start = parsedStart, let end = parsedEnd, end > start,
+              let interval = intervalSeconds else { return [] }
+        return Clipper.splitIntoIntervals(rangeStart: start, rangeEnd: end, intervalSeconds: interval)
+    }
+
+    private var splitPreviewText: String? {
+        let intervals = plannedIntervals
+        guard !intervals.isEmpty, let interval = intervalSeconds else { return nil }
+        let count = intervals.count
+        var text = "→ \(count) clip\(count == 1 ? "" : "s")"
+        if let last = intervals.last, last.end - last.start < interval - 0.001 {
+            text += " (last clip: \(Int((last.end - last.start).rounded()))s)"
+        }
+        return text
+    }
+
     /// nil means valid; otherwise the reason Export is disabled.
     private var validationMessage: String? {
         if startDigits.count < 6 { return "Start time is incomplete." }
@@ -52,6 +87,9 @@ struct EditorView: View {
         guard let end = parsedEnd else { return "End time isn't a valid HH:MM:SS value." }
         if start >= end { return "End time must be after start time." }
         if end > info.durationSeconds + 0.5 { return "End time is beyond the video's duration." }
+        if mode == .split {
+            guard intervalSeconds != nil else { return "Enter an interval greater than 0." }
+        }
         return nil
     }
 
@@ -59,13 +97,32 @@ struct EditorView: View {
         validationMessage == nil && !isExporting
     }
 
+    private var exportButtonLabel: String {
+        guard mode == .split else { return "Export" }
+        let count = plannedIntervals.count
+        return count > 0 ? "Split into \(count) Clip\(count == 1 ? "" : "s")" : "Split into Clips"
+    }
+
     var body: some View {
         VStack(alignment: .center, spacing: 18) {
             header
 
+            Picker("Mode", selection: $mode) {
+                Text("Single Clip").tag(EditMode.single)
+                Text("Split into Equal Clips").tag(EditMode.split)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 340)
+            .disabled(isExporting)
+            .onChange(of: mode) { _ in
+                errorMessage = nil
+                exportResult = nil
+                batchResultURLs = nil
+            }
+
             HStack(spacing: 24) {
-                TimecodeField(label: "Start", digits: $startDigits, disabled: isExporting)
-                TimecodeField(label: "End", digits: $endDigits, disabled: isExporting)
+                TimecodeField(label: mode == .split ? "Range Start" : "Start", digits: $startDigits, disabled: isExporting)
+                TimecodeField(label: mode == .split ? "Range End" : "End", digits: $endDigits, disabled: isExporting)
                 VStack(alignment: .center, spacing: 4) {
                     Text("Total duration").font(.caption).foregroundStyle(.secondary)
                     Text(Timecode.format(info.durationSeconds)).font(.system(.body, design: .monospaced))
@@ -81,10 +138,19 @@ struct EditorView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 160)
 
-                Toggle("Precise cut (re-encodes, slower)", isOn: $precise)
+                if mode == .single {
+                    Toggle("Precise cut (re-encodes, slower)", isOn: $precise)
+                }
             }
 
-            if precise {
+            if mode == .split {
+                intervalRow
+            }
+
+            // Batch splitting always re-encodes to hit exact, gap-free boundaries
+            // between clips -- so quality/resolution are always relevant there,
+            // not gated behind a toggle the way single-clip Precise mode is.
+            if (mode == .single && precise) || mode == .split {
                 preciseOptionsView
             }
 
@@ -97,9 +163,9 @@ struct EditorView: View {
 
             if isExporting {
                 VStack(alignment: .center, spacing: 8) {
-                    ProgressView(value: progress)
+                    ProgressView(value: overallProgress)
                         .frame(maxWidth: 320)
-                    Text(precise ? "Re-encoding… \(Int(progress * 100))%" : "Exporting… \(Int(progress * 100))%")
+                    Text(progressLabel)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Force Stop", role: .destructive) {
@@ -118,8 +184,11 @@ struct EditorView: View {
                     .frame(maxWidth: 460)
             }
 
-            if let exportResult {
+            if mode == .single, let exportResult {
                 resultBanner(exportResult)
+            }
+            if mode == .split, let batchResultURLs {
+                batchResultBanner(batchResultURLs)
             }
 
             Spacer()
@@ -127,7 +196,7 @@ struct EditorView: View {
             HStack(spacing: 16) {
                 Button("Choose a Different File", action: onChooseDifferentFile)
                     .disabled(isExporting)
-                Button("Export") { startExport() }
+                Button(exportButtonLabel) { startExport() }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canExport)
                     .keyboardShortcut(.defaultAction)
@@ -136,6 +205,26 @@ struct EditorView: View {
         .padding(24)
         .frame(minWidth: 520, minHeight: 380)
         .frame(maxWidth: .infinity)
+    }
+
+    private var overallProgress: Double {
+        switch mode {
+        case .single:
+            return progress
+        case .split:
+            guard batchTotalClips > 0 else { return 0 }
+            return (Double(batchCompletedClips) + progress) / Double(batchTotalClips)
+        }
+    }
+
+    private var progressLabel: String {
+        switch mode {
+        case .single:
+            return precise ? "Re-encoding… \(Int(progress * 100))%" : "Exporting… \(Int(progress * 100))%"
+        case .split:
+            let current = min(batchCompletedClips + 1, max(batchTotalClips, 1))
+            return "Clip \(current) of \(batchTotalClips) — Re-encoding… \(Int(progress * 100))%"
+        }
     }
 
     private var availableResolutions: [Clipper.Resolution] {
@@ -167,6 +256,28 @@ struct EditorView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+        }
+        .disabled(isExporting)
+    }
+
+    private var intervalRow: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Interval")
+                IntervalField(digits: $intervalDigits, disabled: isExporting)
+                Picker("Unit", selection: $intervalUnit) {
+                    Text("Seconds").tag(IntervalUnit.seconds)
+                    Text("Minutes").tag(IntervalUnit.minutes)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 160)
+            }
+            if let splitPreviewText {
+                Text(splitPreviewText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .disabled(isExporting)
@@ -206,7 +317,32 @@ struct EditorView: View {
         .frame(maxWidth: 480)
     }
 
+    private func batchResultBanner(_ urls: [URL]) -> some View {
+        HStack {
+            Label("\(urls.count) clip\(urls.count == 1 ? "" : "s") saved to ~/Downloads", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Spacer(minLength: 12)
+            Button("Reveal in Finder") {
+                if let downloads = try? FileManager.default.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
+                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: downloads.path)
+                }
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .background(Color.green.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: 480)
+    }
+
     private func startExport() {
+        switch mode {
+        case .single: startSingleExport()
+        case .split: startBatchExport()
+        }
+    }
+
+    private func startSingleExport() {
         guard let start = parsedStart, let end = parsedEnd else { return }
         errorMessage = nil
         exportResult = nil
@@ -227,6 +363,41 @@ struct EditorView: View {
                 }
                 await MainActor.run {
                     self.exportResult = result
+                    self.isExporting = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                    self.isExporting = false
+                }
+            }
+        }
+    }
+
+    private func startBatchExport() {
+        let intervals = plannedIntervals
+        guard !intervals.isEmpty else { return }
+        errorMessage = nil
+        batchResultURLs = nil
+        batchCompletedClips = 0
+        batchTotalClips = intervals.count
+        progress = 0
+        isExporting = true
+
+        exportTask = Task {
+            do {
+                let urls = try await Clipper.exportBatch(
+                    sourceURL: sourceURL, sourceInfo: info, intervals: intervals,
+                    format: format, qualityTier: qualityTier, resolution: resolution, tools: tools
+                ) { completed, total, fraction in
+                    Task { @MainActor in
+                        batchCompletedClips = completed
+                        batchTotalClips = total
+                        progress = fraction
+                    }
+                }
+                await MainActor.run {
+                    self.batchResultURLs = urls
                     self.isExporting = false
                 }
             } catch {
@@ -272,5 +443,27 @@ private struct TimecodeField: View {
             .frame(width: 110)
             .disabled(disabled)
         }
+    }
+}
+
+/// A text field that only accepts digits, capped at 2 (1-99) -- used for the
+/// bulk-split interval count. Same all-digits, no-invalid-state approach as
+/// `TimecodeField`, just without colon insertion.
+private struct IntervalField: View {
+    @Binding var digits: String
+    var disabled: Bool = false
+
+    var body: some View {
+        TextField("30", text: Binding(
+            get: { digits },
+            set: { newValue in
+                digits = String(newValue.filter(\.isNumber).prefix(2))
+            }
+        ))
+        .textFieldStyle(.roundedBorder)
+        .font(.system(.body, design: .monospaced))
+        .multilineTextAlignment(.center)
+        .frame(width: 60)
+        .disabled(disabled)
     }
 }

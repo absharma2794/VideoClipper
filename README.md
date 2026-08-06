@@ -87,6 +87,28 @@ Turning on **Precise cut** reveals two more choices:
 
 **Resolution** lets you optionally downscale (never upscale — that only wastes space, it doesn't add real detail) to 540p/720p/1080p/1440p/4K, shown alongside the source's actual resolution. Leave it on **Native** to keep the original pixel dimensions.
 
+### Splitting into equal-length clips
+
+Switch the **Mode** picker to **Split into Equal Clips** to turn a long
+recording into many fixed-length clips automatically — e.g. a 1-hour video
+into 120×30-second clips — instead of exporting one clip at a time.
+
+- **Start**/**End** define the range to split (defaults to the whole video).
+- **Interval** is a number (1–99) plus a **Seconds**/**Minutes** unit picker.
+  A live preview shows exactly how many clips that produces, e.g. `→ 120
+  clips`, updating as you type. If the range doesn't divide evenly, the last
+  clip is shorter and the preview says so (`→ 3 clips (last clip: 5s)`).
+- Split mode always re-encodes with frame-exact boundaries — consecutive
+  clips tile the source with zero gaps or duplicated frames. (Fast/Precise
+  isn't a choice here: Fast mode's keyframe-snapped start, fine for one clip,
+  would misalign every clip boundary in a batch.) Quality and Resolution
+  work the same as in Precise mode above.
+- Clips land in `~/Downloads`, named with their own time range (same scheme
+  as single-clip exports), so **Reveal in Finder** opens the folder rather
+  than one file.
+- **Force Stop** stops the whole batch — the clip in progress is killed and
+  its partial file removed; clips already finished are left in place.
+
 ## Notes
 
 - Apple Silicon only by default (`./build.sh`). Pass `--universal` to also

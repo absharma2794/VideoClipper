@@ -166,6 +166,89 @@ enum Clipper {
         }
     }
 
+    // MARK: - Bulk split into equal-length clips
+
+    /// Splits `[rangeStart, rangeEnd)` into consecutive, gap-free, non-overlapping
+    /// intervals of `intervalSeconds` each. The last interval is clamped to
+    /// `rangeEnd`, so it comes out shorter when the range doesn't divide evenly.
+    ///
+    /// Boundaries are computed as `rangeStart + Double(index) * intervalSeconds`
+    /// (multiplication, not repeated addition) so floating-point error can't
+    /// accumulate across many intervals -- important since this same function
+    /// drives both the UI's live clip-count preview and the actual export loop,
+    /// and the two must never disagree.
+    static func splitIntoIntervals(rangeStart: Double, rangeEnd: Double, intervalSeconds: Double) -> [(start: Double, end: Double)] {
+        guard intervalSeconds > 0, rangeEnd > rangeStart else { return [] }
+        var result: [(start: Double, end: Double)] = []
+        var index = 0
+        while true {
+            let start = rangeStart + Double(index) * intervalSeconds
+            if start >= rangeEnd { break }
+            result.append((start: start, end: min(start + intervalSeconds, rangeEnd)))
+            index += 1
+        }
+        return result
+    }
+
+    enum BatchError: LocalizedError {
+        case clipFailed(index: Int, total: Int, underlying: Error)
+
+        var errorDescription: String? {
+            switch self {
+            case .clipFailed(let index, let total, let underlying):
+                if case ExportError.cancelled = underlying {
+                    return "Stopped after clip \(index) of \(total)."
+                }
+                return "Stopped at clip \(index + 1) of \(total): \(underlying.localizedDescription)"
+            }
+        }
+    }
+
+    /// Exports each interval as a separate clip, sequentially -- one ffmpeg
+    /// process at a time, both for simplicity and to avoid any risk of
+    /// contention between concurrent hardware-encoder sessions. Always uses
+    /// Precise mode: Fast mode's keyframe-snapped start (see `export` above)
+    /// would leave gaps or duplicated frames at clip boundaries, which defeats
+    /// the entire point of splitting a video into contiguous pieces.
+    ///
+    /// Stops on the first failure or cancellation and leaves already-completed
+    /// clips in place -- simpler and safer than trying to skip past bad clips
+    /// or roll back finished ones.
+    static func exportBatch(
+        sourceURL: URL,
+        sourceInfo: VideoProbe.Info,
+        intervals: [(start: Double, end: Double)],
+        format: OutputFormat,
+        qualityTier: QualityTier,
+        resolution: Resolution,
+        tools: FFmpegLocator.Tools,
+        onProgress: @escaping (_ completedClips: Int, _ totalClips: Int, _ currentClipFraction: Double) -> Void
+    ) async throws -> [URL] {
+        var outputURLs: [URL] = []
+        for (index, interval) in intervals.enumerated() {
+            do {
+                try Task.checkCancellation()
+            } catch {
+                throw BatchError.clipFailed(index: index, total: intervals.count, underlying: ExportError.cancelled)
+            }
+
+            let request = Request(
+                sourceURL: sourceURL, sourceInfo: sourceInfo, start: interval.start, end: interval.end,
+                format: format, precise: true, qualityTier: qualityTier, resolution: resolution
+            )
+            do {
+                let result = try await export(request, tools: tools) { fraction in
+                    onProgress(index, intervals.count, fraction)
+                }
+                outputURLs.append(result.outputURL)
+            } catch {
+                throw BatchError.clipFailed(index: index, total: intervals.count, underlying: error)
+            }
+        }
+        onProgress(intervals.count, intervals.count, 1.0)
+        return outputURLs
+    }
+
     /// Finds the timestamp of the last video keyframe at or before `target`,
     /// by asking ffprobe for the list of keyframe packets. `-read_intervals`
     /// bounds ffprobe to scanning only `[0, target]` -- without it, ffprobe
@@ -276,6 +359,14 @@ enum Clipper {
             // scale=-2:H keeps the source's aspect ratio, computing width automatically
             // (rounded to an even number, required by most encoders).
             args += ["-vf", "scale=-2:\(targetHeight)"]
+        } else if request.sourceInfo.width % 2 != 0 || request.sourceInfo.height % 2 != 0 {
+            // Native resolution requested, but the source has an odd dimension.
+            // libx264 tolerates that; hevc_videotoolbox (the "Smaller" tier)
+            // does not -- verified it silently truncates by a pixel with no
+            // filter and no error, rather than failing loudly. Make that
+            // rounding explicit and identical across every tier instead of
+            // leaving it to an undocumented per-encoder default.
+            args += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
         }
         if request.format == .mp4 {
             args += ["-movflags", "+faststart"]
