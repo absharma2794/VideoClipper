@@ -355,6 +355,18 @@ enum Clipper {
         args += videoEncodingArguments(tier: request.qualityTier, sourceInfo: request.sourceInfo, outputFormat: request.format)
         args += ["-c:a", "aac", "-b:a", "192k"]
 
+        // Force a keyframe every 2 seconds, regardless of source framerate or
+        // which encoder the quality tier picked. Without this, libx264 falls
+        // back to its default 250-frame GOP -- fine at low framerates, but on
+        // a 60fps source that's a keyframe every ~4.17s. Players can only
+        // resume playback at a keyframe after a seek, so a multi-second GOP
+        // produces exactly what it sounds like: seeking forward/back in the
+        // exported clip stalls (audio drops out) for up to that long while it
+        // waits for/decodes forward to the next keyframe. The time-based
+        // "expr:gte(t,n_forced*2)" form (vs. a fixed frame-count -g) stays
+        // correct regardless of the source's actual framerate.
+        args += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
+
         if let targetHeight = request.resolution.targetHeight {
             // scale=-2:H keeps the source's aspect ratio, computing width automatically
             // (rounded to an even number, required by most encoders).
