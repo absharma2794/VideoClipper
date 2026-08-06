@@ -3,7 +3,10 @@ import AppKit
 
 /// The main editing screen: shows the loaded file's duration, and offers two
 /// modes -- a single Start/End clip, or splitting a range into many
-/// equal-length clips at a fixed interval.
+/// equal-length clips at a fixed interval. Related controls are grouped into
+/// labeled cards (Range, Splitting, Output) rather than one flat list, and
+/// the settings cards are fully replaced by a single focused progress card
+/// while exporting.
 struct EditorView: View {
     let sourceURL: URL
     let info: VideoProbe.Info
@@ -15,9 +18,6 @@ struct EditorView: View {
 
     @State private var mode: EditMode = .single
 
-    /// Raw digits only (up to 6, "HHMMSS") -- TimecodeField is the only thing
-    /// that writes to these, and it strips everything but digits. In Split
-    /// mode these define the *range* to split, not a single clip.
     @State private var startDigits = "000000"
     @State private var endDigits: String
     @State private var format: Clipper.OutputFormat = .mkv
@@ -27,8 +27,6 @@ struct EditorView: View {
 
     @State private var intervalDigits = "30"
     @State private var intervalUnit: IntervalUnit = .seconds
-    /// Seconds only, per request -- no unit picker for this one. "0" (the
-    /// default) means no buffer, identical to today's behavior.
     @State private var bufferDigits = "0"
 
     @State private var isExporting = false
@@ -65,9 +63,7 @@ struct EditorView: View {
         return Double(count) * (intervalUnit == .minutes ? 60 : 1)
     }
 
-    private var bufferSeconds: Double {
-        Double(bufferDigits) ?? 0
-    }
+    private var bufferSeconds: Double { Double(bufferDigits) ?? 0 }
 
     private var plannedIntervals: [(start: Double, end: Double)] {
         guard mode == .split, let start = parsedStart, let end = parsedEnd, end > start,
@@ -87,9 +83,7 @@ struct EditorView: View {
         if let last = intervals.last, (last.end - last.start) < interval - 0.001 {
             notes.append("last clip: \(Int((last.end - last.start).rounded()))s")
         }
-        if !notes.isEmpty {
-            text += " (\(notes.joined(separator: ", ")))"
-        }
+        if !notes.isEmpty { text += " (\(notes.joined(separator: ", ")))" }
         return text
     }
 
@@ -107,9 +101,7 @@ struct EditorView: View {
         return nil
     }
 
-    private var canExport: Bool {
-        validationMessage == nil && !isExporting
-    }
+    private var canExport: Bool { validationMessage == nil && !isExporting }
 
     private var exportButtonLabel: String {
         guard mode == .split else { return "Export" }
@@ -117,114 +109,12 @@ struct EditorView: View {
         return count > 0 ? "Split into \(count) Clip\(count == 1 ? "" : "s")" : "Split into Clips"
     }
 
-    var body: some View {
-        VStack(alignment: .center, spacing: 18) {
-            header
-
-            Picker("Mode", selection: $mode) {
-                Text("Single Clip").tag(EditMode.single)
-                Text("Bulk Clip").tag(EditMode.split)
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 340)
-            .disabled(isExporting)
-            .onChange(of: mode) { _ in
-                errorMessage = nil
-                exportResult = nil
-                batchResultURLs = nil
-            }
-
-            HStack(spacing: 24) {
-                TimecodeField(label: mode == .split ? "Range Start" : "Start", digits: $startDigits, disabled: isExporting)
-                TimecodeField(label: mode == .split ? "Range End" : "End", digits: $endDigits, disabled: isExporting)
-                VStack(alignment: .center, spacing: 4) {
-                    Text("Total duration").font(.caption).foregroundStyle(.secondary)
-                    Text(Timecode.format(info.durationSeconds)).font(.system(.body, design: .monospaced))
-                }
-            }
-
-            HStack(spacing: 20) {
-                Picker("Format", selection: $format) {
-                    ForEach(Clipper.OutputFormat.allCases) { f in
-                        Text(f.displayName).tag(f)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 160)
-
-                if mode == .single {
-                    Toggle("Precise cut (re-encodes, slower)", isOn: $precise)
-                }
-            }
-
-            if mode == .split {
-                intervalRow
-            }
-
-            // Batch splitting always re-encodes to hit exact, gap-free boundaries
-            // between clips -- so quality/resolution are always relevant there,
-            // not gated behind a toggle the way single-clip Precise mode is.
-            if (mode == .single && precise) || mode == .split {
-                preciseOptionsView
-            }
-
-            if let validationMessage, !isExporting {
-                Text(validationMessage)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-            }
-
-            if isExporting {
-                VStack(alignment: .center, spacing: 8) {
-                    ProgressView(value: overallProgress)
-                        .frame(maxWidth: 320)
-                    Text(progressLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("Force Stop", role: .destructive) {
-                        exportTask?.cancel()
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 460)
-            }
-
-            if mode == .single, let exportResult {
-                resultBanner(exportResult)
-            }
-            if mode == .split, let batchResultURLs {
-                batchResultBanner(batchResultURLs)
-            }
-
-            Spacer()
-
-            HStack(spacing: 16) {
-                Button("Choose a Different File", action: onChooseDifferentFile)
-                    .disabled(isExporting)
-                Button(exportButtonLabel) { startExport() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canExport)
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(24)
-        .frame(minWidth: 520, minHeight: 380)
-        .frame(maxWidth: .infinity)
-    }
+    private var showQualitySection: Bool { (mode == .single && precise) || mode == .split }
+    private var availableResolutions: [Clipper.Resolution] { Clipper.Resolution.availableOptions(sourceHeight: info.height) }
 
     private var overallProgress: Double {
         switch mode {
-        case .single:
-            return progress
+        case .single: return progress
         case .split:
             guard batchTotalClips > 0 else { return 0 }
             return (Double(batchCompletedClips) + progress) / Double(batchTotalClips)
@@ -233,90 +123,209 @@ struct EditorView: View {
 
     private var progressLabel: String {
         switch mode {
-        case .single:
-            return precise ? "Re-encoding… \(Int(progress * 100))%" : "Exporting… \(Int(progress * 100))%"
+        case .single: return precise ? "Re-encoding… \(Int(progress * 100))%" : "Exporting… \(Int(progress * 100))%"
         case .split:
             let current = min(batchCompletedClips + 1, max(batchTotalClips, 1))
             return "Clip \(current) of \(batchTotalClips) — Re-encoding… \(Int(progress * 100))%"
         }
     }
 
-    private var availableResolutions: [Clipper.Resolution] {
-        Clipper.Resolution.availableOptions(sourceHeight: info.height)
-    }
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+                .padding(.horizontal, 24)
+                .padding(.vertical, 16)
 
-    private var preciseOptionsView: some View {
-        VStack(spacing: 6) {
-            Picker("Quality", selection: $qualityTier) {
-                ForEach(Clipper.QualityTier.allCases) { tier in
-                    Text(tier.displayName).tag(tier)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 340)
+            Divider()
 
-            HStack(spacing: 8) {
-                Text("Resolution")
-                Picker("Resolution", selection: $resolution) {
-                    ForEach(availableResolutions) { option in
-                        Text(option.displayName).tag(option)
+            // Plain VStack, not a ScrollView -- a ScrollView's ideal size doesn't
+            // hug its content (it reports "give me whatever space is available"),
+            // so when content got shorter after a mode switch, the window stayed
+            // at its previous, taller size and just left dead space below the
+            // cards. A plain VStack's ideal height tracks its children directly,
+            // which is what `.windowResizability(.contentSize)` (set on the
+            // window in MKVClipperApp.swift) needs to shrink the window back
+            // down correctly. Content here is compact enough (at most 3 cards)
+            // that this fits comfortably without needing to scroll.
+            VStack(spacing: 20) {
+                modePicker
+
+                if isExporting {
+                    progressCard
+                } else {
+                    rangeSection
+                    if mode == .split { splittingSection }
+                    outputSection
+                    if let validationMessage {
+                        InlineMessage(text: validationMessage, style: .warning)
+                    }
+                    if let errorMessage {
+                        InlineMessage(text: errorMessage, style: .error, selectable: true)
+                    }
+                    if mode == .single, let exportResult {
+                        resultBanner(exportResult)
+                    }
+                    if mode == .split, let batchResultURLs {
+                        batchResultBanner(batchResultURLs)
                     }
                 }
-                .labelsHidden()
-                .frame(width: 140)
-
-                if info.width > 0, info.height > 0 {
-                    Text("Current: \(info.width)×\(info.height)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
+            .padding(24)
+
+            Divider()
+
+            bottomBar
+                .padding(.horizontal, 24)
+                .padding(.vertical, 14)
         }
-        .disabled(isExporting)
-    }
-
-    private var intervalRow: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 8) {
-                Text("Interval")
-                IntervalField(digits: $intervalDigits, disabled: isExporting)
-                Picker("Unit", selection: $intervalUnit) {
-                    Text("Seconds").tag(IntervalUnit.seconds)
-                    Text("Minutes").tag(IntervalUnit.minutes)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 160)
-
-                Text("Buffer")
-                IntervalField(digits: $bufferDigits, disabled: isExporting)
-                Text("sec").font(.caption).foregroundStyle(.secondary)
-            }
-            if let splitPreviewText {
-                Text(splitPreviewText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .disabled(isExporting)
+        .frame(minWidth: 580)
+        .frame(maxWidth: .infinity)
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "film.fill").foregroundStyle(.secondary)
-            Text(sourceURL.lastPathComponent)
-                .font(.headline)
-                .lineLimit(1)
-                .truncationMode(.middle)
+        HStack(spacing: 12) {
+            Image(systemName: "film.fill").font(.title2).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sourceURL.lastPathComponent).font(.headline).lineLimit(1).truncationMode(.middle)
+                Text("\(Timecode.format(info.durationSeconds)) total · \(info.width)×\(info.height) · \(info.videoCodec.uppercased())")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
         }
+    }
+
+    private var modePicker: some View {
+        Picker("Mode", selection: $mode) {
+            Text("Single Clip").tag(EditMode.single)
+            Text("Bulk Clip").tag(EditMode.split)
+        }
+        .pickerStyle(.segmented)
+        .frame(maxWidth: 360)
+        .disabled(isExporting)
+        .onChange(of: mode) { _ in
+            errorMessage = nil
+            exportResult = nil
+            batchResultURLs = nil
+        }
+    }
+
+    private var rangeSection: some View {
+        SectionCard(title: mode == .split ? "Range to Split" : "Clip Range", systemImage: "timer") {
+            HStack(spacing: 28) {
+                LabeledControl("Start") { TimecodeField(digits: $startDigits, disabled: isExporting) }
+                LabeledControl("End") { TimecodeField(digits: $endDigits, disabled: isExporting) }
+                LabeledControl("Total Duration") {
+                    Text(Timecode.format(info.durationSeconds))
+                        .font(.system(.body, design: .monospaced)).fontWeight(.medium).frame(height: 22)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var splittingSection: some View {
+        SectionCard(title: "Splitting", systemImage: "square.stack.3d.up.fill") {
+            VStack(spacing: 12) {
+                HStack(spacing: 28) {
+                    LabeledControl("Interval") {
+                        HStack(spacing: 8) {
+                            IntervalField(digits: $intervalDigits, disabled: isExporting)
+                            Picker("Unit", selection: $intervalUnit) {
+                                Text("Seconds").tag(IntervalUnit.seconds)
+                                Text("Minutes").tag(IntervalUnit.minutes)
+                            }
+                            .labelsHidden().pickerStyle(.segmented).frame(width: 150)
+                        }
+                    }
+                    LabeledControl("Buffer") {
+                        HStack(spacing: 6) {
+                            IntervalField(digits: $bufferDigits, disabled: isExporting)
+                            Text("sec").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if let splitPreviewText {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.turn.down.right").font(.caption2)
+                        Text(splitPreviewText).font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .disabled(isExporting)
+        }
+    }
+
+    /// Format + (Precise toggle, single-clip only) + Quality/Resolution
+    /// (when relevant) all live in one card. Quality/Resolution rows
+    /// appear/disappear inside it rather than the whole card appearing/
+    /// disappearing, so there's always exactly one "Output" card, never a
+    /// card that pops in and out.
+    private var outputSection: some View {
+        SectionCard(title: "Output", systemImage: "square.and.arrow.up") {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 28) {
+                    LabeledControl("Format") {
+                        Picker("Format", selection: $format) {
+                            ForEach(Clipper.OutputFormat.allCases) { f in Text(f.displayName).tag(f) }
+                        }
+                        .labelsHidden().pickerStyle(.segmented).frame(width: 140)
+                    }
+                    if mode == .single {
+                        Toggle("Precise cut (re-encodes, slower)", isOn: $precise).disabled(isExporting)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                if showQualitySection {
+                    Divider()
+                    LabeledControl("Quality Tier", alignment: .leading) {
+                        Picker("Quality", selection: $qualityTier) {
+                            ForEach(Clipper.QualityTier.allCases) { tier in Text(tier.displayName).tag(tier) }
+                        }
+                        .labelsHidden().pickerStyle(.segmented)
+                    }
+                    LabeledControl("Resolution", alignment: .leading) {
+                        HStack(spacing: 10) {
+                            Picker("Resolution", selection: $resolution) {
+                                ForEach(availableResolutions) { option in Text(option.displayName).tag(option) }
+                            }
+                            .labelsHidden().frame(width: 140)
+                            if info.width > 0, info.height > 0 {
+                                Text("Current: \(info.width)×\(info.height)").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .disabled(isExporting)
+        }
+    }
+
+    private var progressCard: some View {
+        VStack(spacing: 16) {
+            Image(systemName: mode == .split ? "square.stack.3d.up.fill" : "film.fill")
+                .font(.largeTitle).foregroundStyle(.tint)
+            VStack(spacing: 6) {
+                Text(progressLabel).font(.headline)
+                if mode == .split {
+                    Text("\(batchTotalClips) clips total").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            ProgressView(value: overallProgress).frame(maxWidth: 360)
+            Button("Force Stop", role: .destructive) { exportTask?.cancel() }
+                .buttonStyle(.bordered).padding(.top, 4)
+        }
+        .padding(.vertical, 32)
+        .frame(maxWidth: .infinity)
     }
 
     private func resultBanner(_ result: Clipper.Result) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Label("Saved to \(result.outputURL.lastPathComponent)", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .lineLimit(2)
+                    .foregroundStyle(.green).lineLimit(2)
                 Spacer(minLength: 12)
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([result.outputURL])
@@ -325,14 +334,11 @@ struct EditorView: View {
             }
             if result.usedAudioReencodeFallback {
                 Text("Note: the audio track was re-encoded to AAC because it couldn't be copied directly into an MP4 container.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(12)
-        .background(Color.green.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .frame(maxWidth: 480)
+        .padding(14)
+        .background(Color.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func batchResultBanner(_ urls: [URL]) -> some View {
@@ -343,8 +349,7 @@ struct EditorView: View {
                 "\(urls.count) clip\(urls.count == 1 ? "" : "s") saved" + (folderName.map { " to \"\($0)\"" } ?? ""),
                 systemImage: "checkmark.circle.fill"
             )
-            .foregroundStyle(.green)
-            .lineLimit(2)
+            .foregroundStyle(.green).lineLimit(2)
             Spacer(minLength: 12)
             Button("Reveal in Finder") {
                 if let sessionFolder {
@@ -353,10 +358,19 @@ struct EditorView: View {
             }
             .buttonStyle(.bordered)
         }
-        .padding(12)
-        .background(Color.green.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .frame(maxWidth: 480)
+        .padding(14)
+        .background(Color.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var bottomBar: some View {
+        HStack(spacing: 16) {
+            Button("Choose a Different File", action: onChooseDifferentFile).disabled(isExporting)
+            Spacer()
+            Button(exportButtonLabel) { startExport() }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canExport)
+                .keyboardShortcut(.defaultAction)
+        }
     }
 
     private func startExport() {
@@ -381,9 +395,7 @@ struct EditorView: View {
         exportTask = Task {
             do {
                 let result = try await Clipper.export(request, tools: tools) { fraction in
-                    Task { @MainActor in
-                        progress = fraction
-                    }
+                    Task { @MainActor in progress = fraction }
                 }
                 await MainActor.run {
                     self.exportResult = result
@@ -434,12 +446,84 @@ struct EditorView: View {
     }
 }
 
+/// A titled card grouping related controls, with a subtle background so
+/// sections read as distinct groups rather than one flat wall of controls.
+private struct SectionCard<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary, lineWidth: 1))
+    }
+}
+
+/// A small caption label stacked above its control -- the one label style
+/// used everywhere in this screen instead of mixing inline Picker labels
+/// with above-control captions.
+private struct LabeledControl<Content: View>: View {
+    let label: String
+    var alignment: HorizontalAlignment = .center
+    @ViewBuilder let content: Content
+
+    init(_ label: String, alignment: HorizontalAlignment = .center, @ViewBuilder content: () -> Content) {
+        self.label = label
+        self.alignment = alignment
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: alignment, spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            content
+        }
+    }
+}
+
+/// A validation warning or error message with a matching icon and tinted
+/// background, so it reads as a message rather than blending into the form.
+private struct InlineMessage: View {
+    enum Style { case warning, error }
+    let text: String
+    let style: Style
+    var selectable = false
+
+    private var color: Color { style == .warning ? .orange : .red }
+    private var icon: String { style == .warning ? "exclamationmark.triangle.fill" : "xmark.octagon.fill" }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(color)
+            Group {
+                if selectable {
+                    Text(text).textSelection(.enabled)
+                } else {
+                    Text(text)
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
 /// A text field that only ever accepts digits, capped at 6 (HHMMSS), auto-inserting
 /// the ":" separators as they're typed. Whitespace, letters, punctuation, and any
 /// digit beyond the 6th are silently dropped rather than shown -- there is no
 /// intermediate invalid state to correct.
 private struct TimecodeField: View {
-    let label: String
     @Binding var digits: String
     var disabled: Bool = false
 
@@ -453,36 +537,29 @@ private struct TimecodeField: View {
     }
 
     var body: some View {
-        VStack(alignment: .center, spacing: 4) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            TextField("HH:MM:SS", text: Binding(
-                get: { displayText },
-                set: { newValue in
-                    digits = String(newValue.filter(\.isNumber).prefix(6))
-                }
-            ))
-            .textFieldStyle(.roundedBorder)
-            .font(.system(.body, design: .monospaced))
-            .multilineTextAlignment(.center)
-            .frame(width: 110)
-            .disabled(disabled)
-        }
+        TextField("HH:MM:SS", text: Binding(
+            get: { displayText },
+            set: { newValue in digits = String(newValue.filter(\.isNumber).prefix(6)) }
+        ))
+        .textFieldStyle(.roundedBorder)
+        .font(.system(.body, design: .monospaced))
+        .multilineTextAlignment(.center)
+        .frame(width: 110)
+        .disabled(disabled)
     }
 }
 
 /// A text field that only accepts digits, capped at 2 (1-99) -- used for the
-/// bulk-split interval count. Same all-digits, no-invalid-state approach as
-/// `TimecodeField`, just without colon insertion.
+/// bulk-split interval count and buffer. Same all-digits, no-invalid-state
+/// approach as `TimecodeField`, just without colon insertion.
 private struct IntervalField: View {
     @Binding var digits: String
     var disabled: Bool = false
 
     var body: some View {
-        TextField("30", text: Binding(
+        TextField("0", text: Binding(
             get: { digits },
-            set: { newValue in
-                digits = String(newValue.filter(\.isNumber).prefix(2))
-            }
+            set: { newValue in digits = String(newValue.filter(\.isNumber).prefix(2)) }
         ))
         .textFieldStyle(.roundedBorder)
         .font(.system(.body, design: .monospaced))
