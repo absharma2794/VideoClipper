@@ -24,6 +24,21 @@ struct ContentView: View {
     }
 }
 
+/// TEMPORARY, for comparing the 3 redesign candidates side by side -- delete
+/// this enum and the picker in `MainFlowView` once a design is chosen, and
+/// keep only the winning EditorView* file (renamed back to EditorView.swift).
+private enum DesignVariant: String, CaseIterable, Identifiable {
+    case cards, sidebar, focused
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .cards: return "1 · Cards"
+        case .sidebar: return "2 · Sidebar"
+        case .focused: return "3 · Focused"
+        }
+    }
+}
+
 /// Everything after ffmpeg is confirmed present: pick a file, probe it,
 /// then edit/export. Resets to the drop zone when a new file is chosen.
 private struct MainFlowView: View {
@@ -33,6 +48,7 @@ private struct MainFlowView: View {
     @State private var info: VideoProbe.Info?
     @State private var isProbing = false
     @State private var probeError: String?
+    @State private var designVariant: DesignVariant = .cards
 
     var body: some View {
         Group {
@@ -40,7 +56,35 @@ private struct MainFlowView: View {
                 ProgressView("Reading video…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let sourceURL, let info {
-                EditorView(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+                VStack(spacing: 0) {
+                    // TEMPORARY comparison switcher -- see DesignVariant above.
+                    HStack(spacing: 10) {
+                        Text("Design preview:").font(.caption).foregroundStyle(.secondary)
+                        Picker("Design", selection: $designVariant) {
+                            ForEach(DesignVariant.allCases) { variant in
+                                Text(variant.label).tag(variant)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 280)
+                        .labelsHidden()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.yellow.opacity(0.15))
+
+                    Divider()
+
+                    switch designVariant {
+                    case .cards:
+                        EditorViewCards(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+                    case .sidebar:
+                        EditorViewSidebar(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+                    case .focused:
+                        EditorViewFocused(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+                    }
+                }
             } else {
                 VStack(spacing: 12) {
                     DropZoneView(onFilePicked: load)
@@ -51,9 +95,9 @@ private struct MainFlowView: View {
                             .padding(.horizontal, 40)
                     }
                 }
+                .frame(minWidth: 520, minHeight: 380)
             }
         }
-        .frame(minWidth: 520, minHeight: 380)
     }
 
     private func load(url: URL) {
