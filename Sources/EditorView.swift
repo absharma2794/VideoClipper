@@ -109,7 +109,7 @@ struct EditorView: View {
 
             Picker("Mode", selection: $mode) {
                 Text("Single Clip").tag(EditMode.single)
-                Text("Split into Equal Clips").tag(EditMode.split)
+                Text("Bulk Clip").tag(EditMode.split)
             }
             .pickerStyle(.segmented)
             .frame(width: 340)

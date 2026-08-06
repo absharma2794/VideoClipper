@@ -87,11 +87,11 @@ Turning on **Precise cut** reveals two more choices:
 
 **Resolution** lets you optionally downscale (never upscale — that only wastes space, it doesn't add real detail) to 540p/720p/1080p/1440p/4K, shown alongside the source's actual resolution. Leave it on **Native** to keep the original pixel dimensions.
 
-### Splitting into equal-length clips
+### Bulk Clip: splitting into equal-length clips
 
-Switch the **Mode** picker to **Split into Equal Clips** to turn a long
-recording into many fixed-length clips automatically — e.g. a 1-hour video
-into 120×30-second clips — instead of exporting one clip at a time.
+Switch the **Mode** picker to **Bulk Clip** to turn a long recording into
+many fixed-length clips automatically — e.g. a 1-hour video into
+120×30-second clips — instead of exporting one clip at a time.
 
 - **Start**/**End** define the range to split (defaults to the whole video).
 - **Interval** is a number (1–99) plus a **Seconds**/**Minutes** unit picker.
