@@ -149,9 +149,9 @@ Export/progress state leans into the minimalism further — a large `196/218` cl
 
 ## Decision log
 
-*(fill in once a direction is chosen)*
-
-- **Chosen:** —
-- **Why:** —
-- **What changed from the chosen candidate before finalizing:** —
-- **Cleanup performed:** delete `Sources/EditorView{Cards,Sidebar,Focused}.swift` except the winner (renamed back to `Sources/EditorView.swift`), remove the "Design preview" switcher from `Sources/ContentView.swift`, delete the `design-variants-toggle` branch.
+- **Chosen:** Option 1 — Grouped Cards.
+- **Why:** Preferred on sight after trying all three live in the app via the comparison switcher.
+- **What changed from the candidate before finalizing:** Two issues found from screenshots of the actual running app (not present in the original mockup):
+  1. **Window didn't shrink back down** switching from Bulk Clip (more cards) to Single Clip (fewer cards) — left a large dead-space gap below the visible cards. Root cause: the settings content was wrapped in a `ScrollView`, whose ideal size doesn't hug its content, so `.windowResizability(.contentSize)` couldn't shrink the window when content got shorter. Fixed by using a plain `VStack` instead (matches how the pre-redesign app sized correctly; content here is compact enough that scrolling was never actually needed).
+  2. **Output and Quality had drifted into two separate cards** during implementation instead of the single combined card originally proposed in this doc. Merged back into one "Output" card, with the Quality Tier/Resolution rows appearing inline only when relevant rather than the whole card popping in and out.
+- **Cleanup performed:** Deleted `Sources/EditorViewSidebar.swift` and `Sources/EditorViewFocused.swift`; `Sources/EditorViewCards.swift` renamed back to `Sources/EditorView.swift`; removed the "Design preview" switcher from `Sources/ContentView.swift`.
