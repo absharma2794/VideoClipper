@@ -50,6 +50,10 @@ struct EditorView: View {
         _endDigits = State(initialValue: Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: ""))
     }
 
+    private var fullDurationDigits: String {
+        Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: "")
+    }
+
     private var parsedStart: Double? { Self.seconds(fromDigits: startDigits) }
     private var parsedEnd: Double? { Self.seconds(fromDigits: endDigits) }
 
@@ -173,6 +177,12 @@ struct EditorView: View {
             errorMessage = nil
             exportResult = nil
             batchResultURLs = nil
+            // Start/End are shared state across both modes -- without this,
+            // a range narrowed for a quick Single Clip test silently carried
+            // into Bulk Clip, splitting only that leftover range instead of
+            // the whole file with no indication anything was wrong.
+            startDigits = "000000"
+            endDigits = fullDurationDigits
         }
     }
 
