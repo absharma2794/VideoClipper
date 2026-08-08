@@ -1,9 +1,15 @@
 import SwiftUI
+import AppKit
 
 /// Root view: gates on ffmpeg availability, then hands off between the
 /// drop zone and the editor depending on whether a file is loaded.
 struct ContentView: View {
     @StateObject private var appState = AppState()
+
+    /// One fixed square, shared by every screen in the app -- the drop
+    /// zone, the ffmpeg setup screen, and every page of the editor wizard.
+    /// No screen sizes itself independently anymore.
+    static let windowSize: CGFloat = 480
 
     var body: some View {
         Group {
@@ -16,11 +22,37 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(width: Self.windowSize, height: Self.windowSize)
         .onAppear {
             if !appState.hasCheckedOnce {
                 appState.recheckFFmpeg()
             }
         }
+        // The window never needs to resize itself anymore -- every screen
+        // renders inside the same fixed square above. That makes it safe to
+        // also strip `.resizable` from the real NSWindow here, which is the
+        // only way to guarantee the user can't drag the window to a
+        // different size at all (a sizing *hint* like
+        // `.windowResizability(.contentSize)` alone doesn't reliably disable
+        // the resize handles/cursor).
+        .background(WindowResizeLock())
+    }
+}
+
+private struct WindowResizeLock: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { Self.lock(view) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { Self.lock(nsView) }
+    }
+
+    private static func lock(_ view: NSView) {
+        guard let window = view.window else { return }
+        window.styleMask.remove(.resizable)
     }
 }
 
@@ -41,6 +73,7 @@ private struct MainFlowView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let sourceURL, let info {
                 EditorView(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+                    .transition(.opacity)
             } else {
                 VStack(spacing: 12) {
                     DropZoneView(onFilePicked: load)
@@ -53,7 +86,12 @@ private struct MainFlowView: View {
                 }
             }
         }
-        .frame(minWidth: 520, minHeight: 380)
+        // Loading a file swaps the drop zone for the (much taller) editor,
+        // and the window's resize to match briefly lags behind the new
+        // content appearing -- same one-frame overlap with the title bar as
+        // the mode-switch case in EditorView. Fading the editor in masks it
+        // the same way.
+        .animation(.easeInOut(duration: 0.35), value: sourceURL)
     }
 
     private func load(url: URL) {
@@ -63,9 +101,11 @@ private struct MainFlowView: View {
             do {
                 let result = try await VideoProbe.probe(url: url, tools: tools)
                 await MainActor.run {
-                    self.sourceURL = url
-                    self.info = result
-                    self.isProbing = false
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        self.sourceURL = url
+                        self.info = result
+                        self.isProbing = false
+                    }
                 }
             } catch {
                 await MainActor.run {
