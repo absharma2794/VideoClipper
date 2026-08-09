@@ -6,6 +6,9 @@ import AppKit
 /// plus conventional buttons for anyone who'd rather not drag.
 struct DropZoneView: View {
     let onFilePicked: (URL) -> Void
+    /// Shown as a second link right below "I know you have a .mp4 file",
+    /// matching its style, when provided. nil hides it entirely.
+    var onMergeRequested: (() -> Void)?
 
     private static let supportedExtensions: Set<String> = ["mkv", "mp4"]
 
@@ -14,22 +17,31 @@ struct DropZoneView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "film")
-                .font(.system(size: 44))
-                .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
+            VStack(spacing: 16) {
+                Image(systemName: "film")
+                    .font(.system(size: 44))
+                    .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
 
-            Text("Drop an .mkv file here")
-                .font(.title3).bold()
+                Text("Drop an .mkv file here")
+                    .font(.title3).bold()
 
-            Text("or")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text("or")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
-            Button("Choose File…", action: presentOpenPanel)
-                .buttonStyle(.bordered)
+                Button("Choose File…", action: presentOpenPanel)
+                    .buttonStyle(.bordered)
 
-            Button("I know you have a .mp4 file", action: presentOpenPanel)
-                .buttonStyle(.link)
+                Button("I know you have a .mp4 file", action: presentOpenPanel)
+                    .buttonStyle(.link)
+            }
+            .offset(y: 50)
+
+            if let onMergeRequested {
+                Spacer()
+                Button("Merge Multiple Files into One…", action: onMergeRequested)
+                    .buttonStyle(.link)
+            }
 
             if let rejectionMessage {
                 Text(rejectionMessage)

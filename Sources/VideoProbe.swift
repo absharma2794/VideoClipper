@@ -14,6 +14,29 @@ enum VideoProbe {
         /// own efficiency. Not all containers report this (notably some MKVs),
         /// so callers must handle nil.
         let videoBitrate: Int?
+        /// nil when `hasAudio` is false. Used to compare audio compatibility
+        /// across multiple source files before a stream-copy merge.
+        let audioCodec: String?
+        /// The video stream's own declared duration, when the container
+        /// reports one -- distinct from `durationSeconds` (the container-level
+        /// duration), because the two can genuinely disagree on files with an
+        /// internally mismatched video/audio length. nil when unavailable.
+        let videoStreamDurationSeconds: Double?
+        /// The audio stream's own declared duration, same caveat as above.
+        /// nil when `hasAudio` is false or unavailable.
+        let audioStreamDurationSeconds: Double?
+        /// Video frames per second, e.g. 29.97 or 30. Mixing frame rates
+        /// across a stream-copy concat is a well-known source of desync --
+        /// ffmpeg doesn't retime frames during a pure copy, so a boundary
+        /// between differing rates can throw audio/video off for everything
+        /// after it. nil when unavailable.
+        let videoFrameRate: Double?
+        /// nil when `hasAudio` is false or unavailable. Mixing sample rates
+        /// across a stream-copy concat is the audio equivalent of the frame
+        /// rate problem above -- no resampling happens during a pure copy.
+        let audioSampleRate: Int?
+        /// nil when `hasAudio` is false or unavailable.
+        let audioChannels: Int?
     }
 
     enum ProbeError: LocalizedError {
@@ -61,13 +84,23 @@ enum VideoProbe {
             executable: ffprobePath,
             arguments: [
                 "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,duration,sample_rate,channels",
+                "-of", "default=noprint_wrappers=1",
                 url.path,
             ]
         )
-        let hasAudio = !audioOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        var audioFields: [String: String] = [:]
+        for line in audioOutput.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            audioFields[String(parts[0])] = String(parts[1])
+        }
+        let hasAudio = audioFields["codec_name"] != nil
+        let audioCodec = audioFields["codec_name"]
+        let audioStreamDurationSeconds = Double(audioFields["duration"] ?? "")
+        let audioSampleRate = Int(audioFields["sample_rate"] ?? "")
+        let audioChannels = Int(audioFields["channels"] ?? "")
 
         // key=value lines (default=noprint_wrappers=1) parse robustly regardless
         // of which fields are actually present -- some containers omit bit_rate.
@@ -76,7 +109,7 @@ enum VideoProbe {
             arguments: [
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,codec_name,bit_rate",
+                "-show_entries", "stream=width,height,codec_name,bit_rate,duration,r_frame_rate",
                 "-of", "default=noprint_wrappers=1",
                 url.path,
             ]
@@ -90,6 +123,8 @@ enum VideoProbe {
         let width = Int(videoFields["width"] ?? "") ?? 0
         let height = Int(videoFields["height"] ?? "") ?? 0
         let videoCodec = videoFields["codec_name"] ?? "unknown"
+        let videoStreamDurationSeconds = Double(videoFields["duration"] ?? "")
+        let videoFrameRate = parseFrameRateFraction(videoFields["r_frame_rate"])
         var videoBitrate = Int(videoFields["bit_rate"] ?? "")
 
         // Some containers (notably several MKVs) don't declare a per-stream
@@ -107,7 +142,22 @@ enum VideoProbe {
             videoBitrate = Int(formatBitrateOutput?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         }
 
-        return Info(durationSeconds: duration, hasAudio: hasAudio, width: width, height: height, videoCodec: videoCodec, videoBitrate: videoBitrate)
+        return Info(
+            durationSeconds: duration, hasAudio: hasAudio, width: width, height: height,
+            videoCodec: videoCodec, videoBitrate: videoBitrate, audioCodec: audioCodec,
+            videoStreamDurationSeconds: videoStreamDurationSeconds, audioStreamDurationSeconds: audioStreamDurationSeconds,
+            videoFrameRate: videoFrameRate, audioSampleRate: audioSampleRate, audioChannels: audioChannels
+        )
+    }
+
+    /// ffprobe's `r_frame_rate` is a fraction string like "30/1" or "30000/1001".
+    private static func parseFrameRateFraction(_ raw: String?) -> Double? {
+        guard let raw else { return nil }
+        let parts = raw.split(separator: "/")
+        guard parts.count == 2, let numerator = Double(parts[0]), let denominator = Double(parts[1]), denominator != 0 else {
+            return nil
+        }
+        return numerator / denominator
     }
 
     // MARK: - ffmpeg fallback (parses stderr banner when ffprobe is unavailable)
@@ -127,9 +177,32 @@ enum VideoProbe {
         guard let duration = parseDuration(from: text) else {
             throw ProbeError.durationNotFound
         }
-        let hasAudio = text.contains("Stream #") && text.contains("Audio:")
+        let audioCodec = parseAudioCodec(from: text)
+        let hasAudio = audioCodec != nil
         let (width, height, videoCodec, videoBitrate) = parseVideoStreamInfo(from: text)
-        return Info(durationSeconds: duration, hasAudio: hasAudio, width: width, height: height, videoCodec: videoCodec, videoBitrate: videoBitrate)
+        return Info(
+            durationSeconds: duration, hasAudio: hasAudio, width: width, height: height,
+            videoCodec: videoCodec, videoBitrate: videoBitrate, audioCodec: audioCodec,
+            videoStreamDurationSeconds: nil, audioStreamDurationSeconds: nil,
+            // ffmpeg's stderr banner doesn't reliably expose these in a form
+            // worth parsing (this fallback path only runs when ffprobe is
+            // entirely unavailable, an already-rare case) -- the merge
+            // compatibility check simply skips files missing these values.
+            videoFrameRate: nil, audioSampleRate: nil, audioChannels: nil
+        )
+    }
+
+    /// Parses a line like:
+    /// `  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s`
+    private static func parseAudioCodec(from ffmpegOutput: String) -> String? {
+        for line in ffmpegOutput.split(separator: "\n") {
+            guard line.contains("Audio:") else { continue }
+            return line
+                .components(separatedBy: "Audio: ").last?
+                .split(separator: " ").first
+                .map(String.init)
+        }
+        return nil
     }
 
     /// Parses a line like: `  Duration: 00:12:34.56, start: 0.000000, bitrate: 1234 kb/s`

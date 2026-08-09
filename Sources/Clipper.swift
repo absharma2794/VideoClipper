@@ -495,7 +495,7 @@ enum Clipper {
 
     // MARK: - Process execution with progress
 
-    private static func runFFmpeg(
+    static func runFFmpeg(
         _ executable: String,
         _ arguments: [String],
         totalDuration: Double,

@@ -65,6 +65,7 @@ private struct MainFlowView: View {
     @State private var info: VideoProbe.Info?
     @State private var isProbing = false
     @State private var probeError: String?
+    @State private var showMergeFlow = false
 
     var body: some View {
         Group {
@@ -74,9 +75,12 @@ private struct MainFlowView: View {
             } else if let sourceURL, let info {
                 EditorView(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
                     .transition(.opacity)
+            } else if showMergeFlow {
+                MergeClipsView(tools: tools, onExit: { showMergeFlow = false })
+                    .transition(.opacity)
             } else {
                 VStack(spacing: 12) {
-                    DropZoneView(onFilePicked: load)
+                    DropZoneView(onFilePicked: load, onMergeRequested: { showMergeFlow = true })
                     if let probeError {
                         Text(probeError)
                             .font(.caption)
@@ -92,6 +96,7 @@ private struct MainFlowView: View {
         // the mode-switch case in EditorView. Fading the editor in masks it
         // the same way.
         .animation(.easeInOut(duration: 0.35), value: sourceURL)
+        .animation(.easeInOut(duration: 0.35), value: showMergeFlow)
     }
 
     private func load(url: URL) {
