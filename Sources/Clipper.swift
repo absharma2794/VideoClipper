@@ -116,7 +116,7 @@ enum Clipper {
         guard clipDuration > 0 else { throw ExportError.invalidRange }
 
         let directory = try request.outputDirectory ?? exportsBaseFolder()
-        let outputURL = try uniqueOutputURL(in: directory, for: request.sourceURL, start: request.start, end: request.end, format: request.format)
+        let outputURL = try uniqueOutputURL(in: directory, for: request.sourceURL, start: request.start, end: request.end, format: request.format, resolution: request.resolution)
 
         if request.precise {
             let args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL)
@@ -462,35 +462,46 @@ enum Clipper {
         return folder
     }
 
+    /// Finds the first path under `directory` named `base` (optionally with
+    /// `pathExtension`) that doesn't already exist, appending " (2)", " (3)",
+    /// ... on collision. The one place this logic lives -- every export path
+    /// (single clip, a Bulk Clip session folder, a merge output) goes through
+    /// this instead of re-deriving the same while-loop.
+    static func uniqueCandidatePath(base: String, in directory: URL, pathExtension: String? = nil) -> URL {
+        func candidateURL(_ name: String) -> URL {
+            let url = directory.appendingPathComponent(name)
+            return pathExtension.map { url.appendingPathExtension($0) } ?? url
+        }
+        var candidate = candidateURL(base)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = candidateURL("\(base) (\(suffix))")
+            suffix += 1
+        }
+        return candidate
+    }
+
     /// A per-Bulk-Clip-session folder inside `exportsBaseFolder()`, named
     /// after the source file so a session's many same-named-but-different-
     /// timestamp clips stay together instead of loose in the general folder.
-    /// " (2)", " (3)", ... on collision, same pattern as `uniqueOutputURL`
-    /// below, so two sessions on the same source never mix their clips.
     static func uniqueExportSubfolder(named base: String, in parent: URL) throws -> URL {
-        var candidate = parent.appendingPathComponent(base)
-        var suffix = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = parent.appendingPathComponent("\(base) (\(suffix))")
-            suffix += 1
-        }
+        let candidate = uniqueCandidatePath(base: base, in: parent)
         try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
         return candidate
     }
 
-    /// Builds `<directory>/<basename>_clip_<start>-<end>.<ext>`, appending
-    /// " (2)", " (3)", ... on collision so an existing file is never overwritten.
-    private static func uniqueOutputURL(in directory: URL, for sourceURL: URL, start: Double, end: Double, format: OutputFormat) throws -> URL {
+    /// Builds `<directory>/<basename>_clip_<start>-<end>[_<height>p].<ext>`,
+    /// appending " (2)", " (3)", ... on collision so an existing file is
+    /// never overwritten. The resolution suffix is omitted for `.native`
+    /// (today's exact filename, unchanged) and only appears for an actual
+    /// downscale -- needed now that a Queue can produce several exports of
+    /// the same range at different resolutions, which would otherwise all
+    /// collide down to the same stem and just pile up as "(2)", "(3)".
+    private static func uniqueOutputURL(in directory: URL, for sourceURL: URL, start: Double, end: Double, format: OutputFormat, resolution: Resolution) throws -> URL {
         let base = sourceURL.deletingPathExtension().lastPathComponent
-        let stem = "\(base)_clip_\(Timecode.filenameSafe(start))-\(Timecode.filenameSafe(end))"
-
-        var candidate = directory.appendingPathComponent(stem).appendingPathExtension(format.rawValue)
-        var suffix = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = directory.appendingPathComponent("\(stem) (\(suffix))").appendingPathExtension(format.rawValue)
-            suffix += 1
-        }
-        return candidate
+        var stem = "\(base)_clip_\(Timecode.filenameSafe(start))-\(Timecode.filenameSafe(end))"
+        if let height = resolution.targetHeight { stem += "_\(height)p" }
+        return uniqueCandidatePath(base: stem, in: directory, pathExtension: format.rawValue)
     }
 
     // MARK: - Process execution with progress
@@ -518,10 +529,13 @@ enum Clipper {
         // path (logging "Exiting normally, received signal 15" and a non-zero
         // status) rather than dying from an uncaught signal -- so
         // `Process.terminationReason` can't distinguish "we cancelled this"
-        // from "ffmpeg hit a real error". This flag is set by onCancel below
-        // right before terminate() is called, so the termination handler can
-        // tell the difference directly instead of guessing from the signal.
-        let cancelFlag = CancelFlag()
+        // from "ffmpeg hit a real error". This gate is what onCancel below
+        // uses to record that, so the termination handler can tell the
+        // difference directly instead of guessing from the signal -- and
+        // (see the type's own doc comment) it's also what keeps a
+        // cancellation that arrives right as the process is about to launch
+        // from being silently lost.
+        let cancellationGate = CancellationGate()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -561,7 +575,7 @@ enum Clipper {
                         if proc.terminationStatus == 0 {
                             onProgress(1.0)
                             continuation.resume(returning: ())
-                        } else if cancelFlag.isSet {
+                        } else if cancellationGate.isCancelled {
                             continuation.resume(throwing: ExportError.cancelled)
                         } else {
                             let tail = stderrBuffer.tail(lines: 8)
@@ -569,8 +583,21 @@ enum Clipper {
                         }
                     }
 
+                    // `onCancel` (below) can fire before this closure even runs, let
+                    // alone before `process.run()` -- Swift only guarantees it runs
+                    // no *later* than cancellation, not that `operation` has made any
+                    // particular progress first. `cancellationGate.launch(_:)` decides
+                    // "launch or don't" and actually calls `process.run()` under one
+                    // lock shared with `onCancel`'s `cancel()`, so there's no gap
+                    // between the two where a cancellation could be seen by neither
+                    // side -- if `launch(_:)` says no, the process was never started,
+                    // so the continuation is resumed right here instead of waiting on
+                    // a termination handler that will now never fire.
                     do {
-                        try process.run()
+                        guard try cancellationGate.launch(process) else {
+                            continuation.resume(throwing: ExportError.cancelled)
+                            return
+                        }
                         RunningExports.shared.register(process)
                     } catch {
                         continuation.resume(throwing: ExportError.ffmpegFailed(error.localizedDescription))
@@ -578,26 +605,58 @@ enum Clipper {
                 }
             },
             onCancel: {
-                cancelFlag.set()
-                process.terminate()
+                cancellationGate.cancel()
             }
         )
     }
 }
 
 /// Thread-safe one-shot flag: set once, from whichever thread cancels the task.
-private final class CancelFlag: @unchecked Sendable {
-    private var flag = false
+/// Coordinates a `Process`'s launch with cancellation under one lock, so
+/// "should this launch" and "should this be terminated" can never be
+/// decided out of sync with each other. Two independent checks used to
+/// handle this (a plain cancelled flag checked right before `process.run()`,
+/// and a `process.isRunning` check inside `onCancel`) but left a gap: a
+/// cancellation arriving between the first check passing and `process.run()`
+/// actually executing saw "not cancelled yet" on one side and "not running
+/// yet" on the other, so neither side terminated it -- it launched and ran
+/// to completion, silently ignoring a Force Stop that arrived at exactly
+/// the wrong instant.
+private final class CancellationGate: @unchecked Sendable {
+    private enum State { case idle, launched(Process), cancelled }
+    private var state: State = .idle
     private let lock = NSLock()
 
-    func set() {
+    var isCancelled: Bool {
         lock.lock(); defer { lock.unlock() }
-        flag = true
+        if case .cancelled = state { return true }
+        return false
     }
 
-    var isSet: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return flag
+    /// Launches `process` unless cancellation already won the race; returns
+    /// whether it actually launched. Holds the lock across `process.run()`
+    /// itself (a fast local syscall) so `cancel()` can't observe or act on
+    /// a half-finished transition.
+    @discardableResult
+    func launch(_ process: Process) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .idle = state else { return false }
+        try process.run()
+        state = .launched(process)
+        return true
+    }
+
+    /// Terminates `process` immediately if it's already launched;
+    /// otherwise just marks cancelled so a `launch(_:)` call still in
+    /// flight skips starting it at all.
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .launched(let process) = state {
+            process.terminate()
+        }
+        state = .cancelled
     }
 }
 

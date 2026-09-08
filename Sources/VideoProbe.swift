@@ -90,12 +90,7 @@ enum VideoProbe {
                 url.path,
             ]
         )
-        var audioFields: [String: String] = [:]
-        for line in audioOutput.split(separator: "\n") {
-            let parts = line.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            audioFields[String(parts[0])] = String(parts[1])
-        }
+        let audioFields = parseKeyValueFields(audioOutput)
         let hasAudio = audioFields["codec_name"] != nil
         let audioCodec = audioFields["codec_name"]
         let audioStreamDurationSeconds = Double(audioFields["duration"] ?? "")
@@ -114,12 +109,7 @@ enum VideoProbe {
                 url.path,
             ]
         )
-        var videoFields: [String: String] = [:]
-        for line in videoOutput.split(separator: "\n") {
-            let parts = line.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            videoFields[String(parts[0])] = String(parts[1])
-        }
+        let videoFields = parseKeyValueFields(videoOutput)
         let width = Int(videoFields["width"] ?? "") ?? 0
         let height = Int(videoFields["height"] ?? "") ?? 0
         let videoCodec = videoFields["codec_name"] ?? "unknown"
@@ -148,6 +138,19 @@ enum VideoProbe {
             videoStreamDurationSeconds: videoStreamDurationSeconds, audioStreamDurationSeconds: audioStreamDurationSeconds,
             videoFrameRate: videoFrameRate, audioSampleRate: audioSampleRate, audioChannels: audioChannels
         )
+    }
+
+    /// Parses ffprobe's `default=noprint_wrappers=1` output (one `key=value`
+    /// per line) into a dictionary. Shared by both the audio- and video-stream
+    /// queries above, which ask for different fields but get the same shape back.
+    private static func parseKeyValueFields(_ output: String) -> [String: String] {
+        var fields: [String: String] = [:]
+        for line in output.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            fields[String(parts[0])] = String(parts[1])
+        }
+        return fields
     }
 
     /// ffprobe's `r_frame_rate` is a fraction string like "30/1" or "30000/1001".

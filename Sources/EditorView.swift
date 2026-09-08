@@ -1,6 +1,36 @@
 import SwiftUI
 import AppKit
 
+/// Everything needed to reopen `EditorView` on an already-loaded file with a
+/// past export's settings pre-filled, for "Export Another Version of This
+/// File" reached from the Queue screen -- a fresh `EditorView` instance has
+/// no state of its own to carry those settings, unlike the in-place version
+/// of this same action reached directly from the completed page (see
+/// `EditorView.exportAnotherVersion()`), which just leaves its own `@State`
+/// untouched instead. Always lands in Single Clip mode -- the queue only
+/// ever runs single-clip exports (Bulk Clip is excluded from it entirely).
+struct EditorPrefill {
+    var startDigits: String
+    var endDigits: String
+    var format: Clipper.OutputFormat
+    var precise: Bool
+    var qualityTier: Clipper.QualityTier
+    var resolution: Clipper.Resolution
+
+    init(job: ExportJob) {
+        startDigits = Self.digits(from: job.request.start)
+        endDigits = Self.digits(from: job.request.end)
+        format = job.request.format
+        precise = job.request.precise
+        qualityTier = job.request.qualityTier
+        resolution = job.request.resolution
+    }
+
+    private static func digits(from seconds: Double) -> String {
+        Timecode.format(seconds).replacingOccurrences(of: ":", with: "")
+    }
+}
+
 /// A paged wizard, not a single scrolling form: each step is its own page,
 /// navigated with Back/Next like pushing and popping a stack, always
 /// sliding a whole new page in rather than reflowing the current one in
@@ -11,6 +41,7 @@ struct EditorView: View {
     let info: VideoProbe.Info
     let tools: FFmpegLocator.Tools
     let onChooseDifferentFile: () -> Void
+    let onQueueRequested: () -> Void
 
     private enum EditMode { case single, split }
     private enum IntervalUnit { case seconds, minutes }
@@ -42,12 +73,26 @@ struct EditorView: View {
     @State private var batchTotalClips = 0
     @State private var batchResultURLs: [URL]?
 
-    init(sourceURL: URL, info: VideoProbe.Info, tools: FFmpegLocator.Tools, onChooseDifferentFile: @escaping () -> Void) {
+    @ObservedObject private var queue = ExportQueue.shared
+
+    init(sourceURL: URL, info: VideoProbe.Info, tools: FFmpegLocator.Tools, onChooseDifferentFile: @escaping () -> Void, onQueueRequested: @escaping () -> Void, prefill: EditorPrefill? = nil) {
         self.sourceURL = sourceURL
         self.info = info
         self.tools = tools
         self.onChooseDifferentFile = onChooseDifferentFile
-        _endDigits = State(initialValue: Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: ""))
+        self.onQueueRequested = onQueueRequested
+        if let prefill {
+            _mode = State(initialValue: .single)
+            _startDigits = State(initialValue: prefill.startDigits)
+            _endDigits = State(initialValue: prefill.endDigits)
+            _format = State(initialValue: prefill.format)
+            _precise = State(initialValue: prefill.precise)
+            _qualityTier = State(initialValue: prefill.qualityTier)
+            _resolution = State(initialValue: prefill.resolution)
+            _page = State(initialValue: .rangeSettings)
+        } else {
+            _endDigits = State(initialValue: Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: ""))
+        }
     }
 
     private var fullDurationDigits: String {
@@ -107,7 +152,18 @@ struct EditorView: View {
         return nil
     }
 
-    private var canExport: Bool { validationMessage == nil && !isExporting }
+    // `queue.activeCount == 0` closes a real concurrency hole: without it, a
+    // running/queued job wouldn't stop the direct Export path from starting
+    // a *second*, fully independent ffmpeg process at the same time -- two
+    // exports genuinely running at once, which is exactly what routing
+    // everything through one sequential queue was supposed to prevent. This
+    // also means the direct progress/completed pages below can never appear
+    // while the queue is active, since Export is the only way to reach them.
+    private var canExport: Bool { validationMessage == nil && !isExporting && queue.activeCount == 0 }
+    // Deliberately independent of `isExporting`/`queue.activeCount` --
+    // queueing more work is exactly what you're meant to keep doing while
+    // something else is already running.
+    private var canAddToQueue: Bool { validationMessage == nil && queue.canEnqueue }
 
     private var exportButtonLabel: String {
         guard mode == .split else { return "Export" }
@@ -141,13 +197,6 @@ struct EditorView: View {
         }
     }
 
-    private var pageTransition: AnyTransition {
-        .asymmetric(
-            insertion: .move(edge: navigatingForward ? .trailing : .leading).combined(with: .opacity),
-            removal: .move(edge: navigatingForward ? .leading : .trailing).combined(with: .opacity)
-        )
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             if isExporting {
@@ -165,7 +214,7 @@ struct EditorView: View {
                     }
                 }
                 .id(page)
-                .transition(pageTransition)
+                .transition(wizardPageTransition(navigatingForward: navigatingForward))
             }
         }
         .frame(width: 480, height: 480)
@@ -241,6 +290,7 @@ struct EditorView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 Spacer()
+                QueueBubble(count: queue.jobs.count, isRunning: queue.isRunning, onTap: onQueueRequested)
                 Button("Next →") { goNext() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
@@ -283,8 +333,8 @@ struct EditorView: View {
             VStack(spacing: 24) {
                 VStack(spacing: 10) {
                     HStack(spacing: 36) {
-                        LabeledControlFocused("Start", labelFont: .subheadline) { TimecodeFieldFocused(digits: $startDigits) }
-                        LabeledControlFocused("End", labelFont: .subheadline) { TimecodeFieldFocused(digits: $endDigits) }
+                        LabeledWizardControl("Start", labelFont: .subheadline) { TimecodeFieldFocused(digits: $startDigits) }
+                        LabeledWizardControl("End", labelFont: .subheadline) { TimecodeFieldFocused(digits: $endDigits) }
                     }
                     Text("of \(Timecode.format(info.durationSeconds)) total")
                         .font(.subheadline)
@@ -321,6 +371,7 @@ struct EditorView: View {
             HStack {
                 Button("← Back") { goBack() }.buttonStyle(.bordered)
                 Spacer()
+                QueueBubble(count: queue.jobs.count, isRunning: queue.isRunning, onTap: onQueueRequested)
                 Button("Next →") { goNext() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
@@ -366,7 +417,7 @@ struct EditorView: View {
                 }
 
                 if mode == .split {
-                    LabeledControlFocused("Buffer (seconds)", labelFont: .system(size: 13)) {
+                    LabeledWizardControl("Buffer (seconds)", labelFont: .system(size: 13)) {
                         HStack(spacing: 6) {
                             IntervalFieldFocused(digits: $bufferDigits)
                             Text("sec").font(.system(size: 13)).foregroundStyle(.secondary)
@@ -375,7 +426,7 @@ struct EditorView: View {
                     noteRow("Overlaps each clip with the end of the one before it, so nothing gets cut off mid-moment. Clip 1 is unaffected.")
                 }
 
-                LabeledControlFocused("Format", labelFont: .system(size: 13)) {
+                LabeledWizardControl("Format", labelFont: .system(size: 13)) {
                     Picker("Format", selection: $format) {
                         ForEach(Clipper.OutputFormat.allCases) { f in Text(f.displayName).tag(f) }
                     }
@@ -386,13 +437,13 @@ struct EditorView: View {
                     noteRow("Bulk clips are always precisely cut, so every clip starts exactly on time.")
                 }
 
-                LabeledControlFocused("Quality", labelFont: .system(size: 13)) {
+                LabeledWizardControl("Quality", labelFont: .system(size: 13)) {
                     Picker("Quality", selection: $qualityTier) {
                         ForEach(Clipper.QualityTier.allCases) { tier in Text(tier.displayName).tag(tier) }
                     }
                     .labelsHidden().pickerStyle(.segmented).controlSize(.large).frame(width: 330)
                 }
-                LabeledControlFocused("Resolution", labelFont: .system(size: 13)) {
+                LabeledWizardControl("Resolution", labelFont: .system(size: 13)) {
                     HStack(spacing: 8) {
                         Picker("Resolution", selection: $resolution) {
                             ForEach(availableResolutions) { option in Text(option.displayName).tag(option) }
@@ -407,6 +458,17 @@ struct EditorView: View {
             HStack {
                 Button("← Back") { goBack() }.buttonStyle(.bordered)
                 Spacer()
+                QueueBubble(count: queue.jobs.count, isRunning: queue.isRunning, onTap: onQueueRequested)
+                // Single Clip only -- Bulk Clip already runs as its own
+                // sequential batch within one wizard action, so it's
+                // excluded from the queue entirely rather than mixing two
+                // different kinds of multi-export operation into it.
+                if mode == .single {
+                    Button("Add to Queue") { addToQueue() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .disabled(!canAddToQueue)
+                }
                 Button(exportButtonLabel) { startExport() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
@@ -432,72 +494,47 @@ struct EditorView: View {
     // MARK: - Page 5: Progress
 
     private var progressPage: some View {
-        VStack(spacing: 6) {
-            if mode == .split {
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text("\(min(batchCompletedClips + 1, max(batchTotalClips, 1)))")
-                        .font(.system(size: 46, weight: .thin, design: .rounded))
-                    Text("/\(batchTotalClips)")
-                        .font(.system(size: 22, weight: .thin, design: .rounded))
-                        .foregroundStyle(.secondary)
-                }
-                .monospacedDigit()
-            } else {
-                Text("\(Int(progress * 100))%")
-                    .font(.system(size: 46, weight: .thin, design: .rounded))
+        WizardProgressPage(
+            counter: {
+                if mode == .split {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text("\(min(batchCompletedClips + 1, max(batchTotalClips, 1)))")
+                            .font(.system(size: 46, weight: .thin, design: .rounded))
+                        Text("/\(batchTotalClips)")
+                            .font(.system(size: 22, weight: .thin, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
                     .monospacedDigit()
-            }
-
-            Text(mode == .split ? "Re-encoding this clip… \(Int(progress * 100))%" : (precise ? "Re-encoding…" : "Exporting…"))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 18)
-
-            ProgressView(value: overallProgress)
-                .frame(maxWidth: 260)
-                .padding(.bottom, 20)
-
-            Button("Force Stop", role: .destructive) { exportTask?.cancel() }
-                .buttonStyle(.bordered)
-                .tint(.red)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    Text("\(Int(progress * 100))%")
+                        .font(.system(size: 46, weight: .thin, design: .rounded))
+                        .monospacedDigit()
+                }
+            },
+            statusText: mode == .split ? "Re-encoding this clip… \(Int(progress * 100))%" : (precise ? "Re-encoding…" : "Exporting…"),
+            progress: overallProgress,
+            onForceStop: { exportTask?.cancel() }
+        )
     }
 
     // MARK: - Page 6/7: Completed
 
     private var completedPage: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 44))
-                .foregroundStyle(.green)
-            Text(completedText)
-                .font(.headline)
-                .foregroundStyle(.green)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-            if mode == .single, exportResult?.usedAudioReencodeFallback == true {
-                Text("Note: the audio track was re-encoded to AAC because it couldn't be copied directly into an MP4 container.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 360)
-            }
-            HStack(spacing: 10) {
-                Button("Reveal in Finder") { revealCompletedResult() }
-                    .buttonStyle(.bordered)
-                Button("Done") { dismissCompleted() }
-                    .buttonStyle(.borderedProminent)
-            }
-            .padding(.top, 6)
-            Button(action: onChooseDifferentFile) {
-                Text("Choose a Different File").underline()
-            }
-            .buttonStyle(.plain)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        WizardCompletedPage(
+            message: completedText,
+            note: (mode == .single && exportResult?.usedAudioReencodeFallback == true)
+                ? "Note: the audio track was re-encoded to AAC because it couldn't be copied directly into an MP4 container."
+                : nil,
+            onReveal: revealCompletedResult,
+            // Done now means "I'm finished with this file" -- straight back
+            // to the drop zone, the same as "Choose a Different File" used
+            // to be a separate link for. With Export Another Version below
+            // covering "keep working on this file", that second link was
+            // just a redundant middle option between the two.
+            onDone: onChooseDifferentFile,
+            secondaryActionLabel: "Export Another Version of This File",
+            onSecondaryAction: exportAnotherVersion
+        )
     }
 
     private func revealCompletedResult() {
@@ -513,34 +550,28 @@ struct EditorView: View {
         }
     }
 
-    private func dismissCompleted() {
+    /// Deliberately leaves every setting untouched (range, format, quality,
+    /// resolution) -- the whole point is tweaking just one thing (a
+    /// different resolution, a different range) without re-entering
+    /// everything else, per the user's own "trim a different interval on
+    /// the 2nd export" use case. Lands on Range Settings specifically, one
+    /// step ahead of Advanced Settings, matching that same use case. Unlike
+    /// Done, which now leaves the file behind entirely, this stays on it.
+    private func exportAnotherVersion() {
         exportResult = nil
         batchResultURLs = nil
-        navigatingForward = false
-        page = .modeSelect
+        navigatingForward = true
+        page = .rangeSettings
     }
 
     // MARK: - Page 8: Stopped mid-way
 
     private var stoppedPage: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 40))
-                .foregroundStyle(.orange)
-            Text(errorMessage ?? "Export stopped.")
-                .font(.callout)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-            Button("Go Back") {
-                errorMessage = nil
-                navigatingForward = false
-                page = .rangeSettings
-            }
-            .buttonStyle(.borderedProminent)
+        WizardStoppedPage(message: errorMessage ?? "Export stopped.") {
+            errorMessage = nil
+            navigatingForward = false
+            page = .rangeSettings
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - fileHeader
@@ -556,6 +587,24 @@ struct EditorView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: - Add to Queue
+
+    /// Builds the same request `startSingleExport` below already builds, but
+    /// hands it to `ExportQueue` instead of running a local blocking `Task`
+    /// -- this touches none of `isExporting`/`progress`/`exportTask`, which
+    /// remain exclusively the direct-Export path's state. Single Clip only;
+    /// the button that calls this is hidden entirely in Bulk Clip mode.
+    private func addToQueue() {
+        guard let start = parsedStart, let end = parsedEnd else { return }
+        let request = Clipper.Request(
+            sourceURL: sourceURL, sourceInfo: info, start: start, end: end, format: format,
+            precise: precise, qualityTier: qualityTier, resolution: resolution
+        )
+        let summary = "\(resolution.displayName) · \(Timecode.format(start))–\(Timecode.format(end))"
+        let job = ExportJob(request: request, tools: tools, settingsSummary: summary)
+        queue.enqueue(job)
     }
 
     // MARK: - Export
@@ -637,24 +686,6 @@ struct EditorView: View {
     }
 }
 
-private struct LabeledControlFocused<Content: View>: View {
-    let label: String
-    let labelFont: Font
-    @ViewBuilder let content: Content
-
-    init(_ label: String, labelFont: Font = .caption, @ViewBuilder content: () -> Content) {
-        self.label = label
-        self.labelFont = labelFont
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(label).font(labelFont).foregroundStyle(.secondary)
-            content
-        }
-    }
-}
 
 private struct TimecodeFieldFocused: View {
     @Binding var digits: String

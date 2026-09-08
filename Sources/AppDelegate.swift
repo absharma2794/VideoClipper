@@ -6,6 +6,10 @@ import AppKit
 /// the parent app exits.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Stops the queue's run loop from starting another job in the sliver
+        // of time before the app actually exits -- the hard kill of whatever
+        // is still running is RunningExports.terminateAll() below, unchanged.
+        ExportQueue.shared.cancelAll()
         RunningExports.shared.terminateAll()
         return .terminateNow
     }

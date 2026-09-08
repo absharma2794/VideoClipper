@@ -61,33 +61,75 @@ private struct WindowResizeLock: NSViewRepresentable {
 private struct MainFlowView: View {
     let tools: FFmpegLocator.Tools
 
+    @ObservedObject private var queue = ExportQueue.shared
+
     @State private var sourceURL: URL?
     @State private var info: VideoProbe.Info?
     @State private var isProbing = false
     @State private var probeError: String?
     @State private var showMergeFlow = false
+    @State private var showQueue = false
+    /// Set only by `reopen(from:)`, consumed once by the `EditorView` that
+    /// `editorSessionID` forces fresh whenever this changes -- see that
+    /// property's own comment for why nil-ing this out separately isn't
+    /// needed the way it might look at first.
+    @State private var pendingPrefill: EditorPrefill?
+    /// Forces a brand-new `EditorView` identity (and so a fresh `@State`,
+    /// correctly re-seeded from `prefill`) exactly when `load(url:)` or
+    /// `reopen(from:)` actually starts a new editing session -- bumped
+    /// alongside `sourceURL`/`pendingPrefill` in both. Without this,
+    /// `.id(sourceURL)` alone would fail to refresh state for "reopen this
+    /// same already-loaded file with different settings", and relying on
+    /// `EditorView` being torn down by leaving/re-entering its branch (the
+    /// previous approach) is exactly what let a mere trip to the Export
+    /// Queue silently discard whatever the user had typed -- fixed below by
+    /// keeping every branch mounted in a `ZStack` instead of an if/else-if
+    /// chain, so this ID is now the ONLY thing that resets `EditorView`.
+    @State private var editorSessionID = UUID()
 
     var body: some View {
-        Group {
-            if isProbing {
-                ProgressView("Reading video…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let sourceURL, let info {
-                EditorView(sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset)
+        ZStack {
+            Group {
+                if isProbing {
+                    ProgressView("Reading video…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let sourceURL, let info {
+                    EditorView(
+                        sourceURL: sourceURL, info: info, tools: tools, onChooseDifferentFile: reset,
+                        onQueueRequested: { showQueue = true }, prefill: pendingPrefill
+                    )
+                    .id(editorSessionID)
                     .transition(.opacity)
-            } else if showMergeFlow {
-                MergeClipsView(tools: tools, onExit: { showMergeFlow = false })
-                    .transition(.opacity)
-            } else {
-                VStack(spacing: 12) {
-                    DropZoneView(onFilePicked: load, onMergeRequested: { showMergeFlow = true })
-                    if let probeError {
-                        Text(probeError)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .padding(.horizontal, 40)
+                } else if showMergeFlow {
+                    MergeClipsView(tools: tools, onExit: { showMergeFlow = false }, onQueueRequested: { showQueue = true })
+                        .transition(.opacity)
+                } else {
+                    VStack(spacing: 12) {
+                        DropZoneView(
+                            onFilePicked: load, onMergeRequested: { showMergeFlow = true },
+                            queueCount: queue.jobs.count, queueIsRunning: queue.isRunning,
+                            onQueueRequested: { showQueue = true }
+                        )
+                        if let probeError {
+                            Text(probeError)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .padding(.horizontal, 40)
+                        }
                     }
                 }
+            }
+            // A ZStack layer, not a branch of the Group above: the Export
+            // Queue used to be a sibling `if` in that same if/else-if chain,
+            // which meant opening it tore down whichever wizard was
+            // underneath (discarding all its in-progress state) and
+            // rebuilt a fresh one on return. Layering it on top instead
+            // keeps EditorView/MergeClipsView alive and untouched the whole
+            // time -- ExportQueueView now needs its own opaque background
+            // for this to look right (see its own comment).
+            if showQueue {
+                ExportQueueView(onClose: { showQueue = false }, onExportAnotherVersion: reopen(from:))
+                    .transition(.opacity)
             }
         }
         // Loading a file swaps the drop zone for the (much taller) editor,
@@ -97,11 +139,14 @@ private struct MainFlowView: View {
         // the same way.
         .animation(.easeInOut(duration: 0.35), value: sourceURL)
         .animation(.easeInOut(duration: 0.35), value: showMergeFlow)
+        .animation(.easeInOut(duration: 0.35), value: showQueue)
+        .animation(.easeInOut(duration: 0.35), value: editorSessionID)
     }
 
     private func load(url: URL) {
         probeError = nil
         isProbing = true
+        pendingPrefill = nil
         Task {
             do {
                 let result = try await VideoProbe.probe(url: url, tools: tools)
@@ -110,6 +155,7 @@ private struct MainFlowView: View {
                         self.sourceURL = url
                         self.info = result
                         self.isProbing = false
+                        self.editorSessionID = UUID()
                     }
                 }
             } catch {
@@ -125,5 +171,18 @@ private struct MainFlowView: View {
         sourceURL = nil
         info = nil
         probeError = nil
+        pendingPrefill = nil
+    }
+
+    /// Reopens `EditorView` on a queued job's file with its settings
+    /// pre-filled, whether or not that file is the one currently loaded --
+    /// no re-probe needed, since `VideoProbe.Info` was already captured once
+    /// when the job was enqueued.
+    private func reopen(from job: ExportJob) {
+        showQueue = false
+        sourceURL = job.request.sourceURL
+        info = job.request.sourceInfo
+        pendingPrefill = EditorPrefill(job: job)
+        editorSessionID = UUID()
     }
 }
