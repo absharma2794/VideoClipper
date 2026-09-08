@@ -1,11 +1,11 @@
 import SwiftUI
 
-/// Shared building blocks for the app's two paged wizards (`EditorView`'s
-/// Single Clip/Bulk Clip flow and `MergeClipsView`'s merge flow), which
-/// deliberately share one visual language -- same dark theme, same slide
-/// transitions, same progress/completed/stopped page shapes -- but started
-/// out as independent copies of each other. Centralizing them here means a
-/// design change to any of these only needs to happen once.
+/// Shared building blocks for the app's paged wizard (`EditorView`'s Single
+/// Clip/Bulk Clip flow) and the Export Queue screen, which deliberately
+/// share one visual language -- same dark theme, same slide transitions,
+/// same progress/completed/stopped page shapes -- rather than each hand-
+/// rolling its own copy. Centralizing them here means a design change to
+/// any of these only needs to happen once.
 
 /// The asymmetric slide transition used for pushing/popping wizard pages:
 /// new content enters from the trailing edge and exits toward the leading
@@ -76,9 +76,8 @@ struct WizardProgressPage<Counter: View>: View {
 
 /// A green checkmark, a headline message, an optional secondary note, and
 /// Reveal in Finder / Done buttons. `secondaryAction` is an optional extra
-/// link below those two (EditorView's completed page uses it for "Export
-/// Another Version of This File"; MergeClipsView's doesn't offer one; nil
-/// hides it).
+/// link below those two -- EditorView's completed page uses it for "Export
+/// Another Version of This File"; nil hides it.
 struct WizardCompletedPage: View {
     let message: String
     var note: String?

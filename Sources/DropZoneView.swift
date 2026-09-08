@@ -6,14 +6,9 @@ import AppKit
 /// plus conventional buttons for anyone who'd rather not drag.
 struct DropZoneView: View {
     let onFilePicked: (URL) -> Void
-    /// Shown as a second link right below "I know you have a .mp4 file",
-    /// matching its style, when provided. nil hides it entirely.
-    var onMergeRequested: (() -> Void)?
     /// The same `QueueBubble` pill every other screen uses for this --
-    /// shown below the merge link when there's anything queued.
-    /// `QueueBubble` itself hides when `queueCount` is 0, so this doesn't
-    /// need its own separate visibility check the way `onMergeRequested`'s
-    /// does.
+    /// shown below the file-picking controls when there's anything queued.
+    /// `QueueBubble` itself hides when `queueCount` is 0.
     var queueCount: Int = 0
     var queueIsRunning: Bool = false
     var onQueueRequested: (() -> Void)?
@@ -45,17 +40,9 @@ struct DropZoneView: View {
             }
             .offset(y: 50)
 
-            if onMergeRequested != nil || onQueueRequested != nil {
+            if let onQueueRequested {
                 Spacer()
-                VStack(spacing: 8) {
-                    if let onMergeRequested {
-                        Button("Merge Multiple Files into One…", action: onMergeRequested)
-                            .buttonStyle(.link)
-                    }
-                    if let onQueueRequested {
-                        QueueBubble(count: queueCount, isRunning: queueIsRunning, onTap: onQueueRequested)
-                    }
-                }
+                QueueBubble(count: queueCount, isRunning: queueIsRunning, onTap: onQueueRequested)
             }
 
             if let rejectionMessage {

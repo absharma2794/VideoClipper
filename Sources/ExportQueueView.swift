@@ -15,9 +15,8 @@ import AppKit
 /// The list is the first genuinely scrolling content in the app -- every
 /// other page centers a fixed, known-size block, but a queue's row count is
 /// unbounded over a session. Rows stay deliberately light -- plain
-/// underlined links and icon buttons, the same secondary-action language
-/// `MergeClipsView`'s file list already uses -- rather than a row of boxed
-/// buttons, which read as much heavier than anything else in the app.
+/// underlined links and icon buttons -- rather than a row of boxed buttons,
+/// which read as much heavier than anything else in the app.
 struct ExportQueueView: View {
     @ObservedObject private var queue = ExportQueue.shared
     let onClose: () -> Void

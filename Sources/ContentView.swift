@@ -67,7 +67,6 @@ private struct MainFlowView: View {
     @State private var info: VideoProbe.Info?
     @State private var isProbing = false
     @State private var probeError: String?
-    @State private var showMergeFlow = false
     @State private var showQueue = false
     /// Set only by `reopen(from:)`, consumed once by the `EditorView` that
     /// `editorSessionID` forces fresh whenever this changes -- see that
@@ -100,13 +99,10 @@ private struct MainFlowView: View {
                     )
                     .id(editorSessionID)
                     .transition(.opacity)
-                } else if showMergeFlow {
-                    MergeClipsView(tools: tools, onExit: { showMergeFlow = false }, onQueueRequested: { showQueue = true })
-                        .transition(.opacity)
                 } else {
                     VStack(spacing: 12) {
                         DropZoneView(
-                            onFilePicked: load, onMergeRequested: { showMergeFlow = true },
+                            onFilePicked: load,
                             queueCount: queue.jobs.count, queueIsRunning: queue.isRunning,
                             onQueueRequested: { showQueue = true }
                         )
@@ -124,9 +120,9 @@ private struct MainFlowView: View {
             // which meant opening it tore down whichever wizard was
             // underneath (discarding all its in-progress state) and
             // rebuilt a fresh one on return. Layering it on top instead
-            // keeps EditorView/MergeClipsView alive and untouched the whole
-            // time -- ExportQueueView now needs its own opaque background
-            // for this to look right (see its own comment).
+            // keeps EditorView alive and untouched the whole time --
+            // ExportQueueView now needs its own opaque background for this
+            // to look right (see its own comment).
             if showQueue {
                 ExportQueueView(onClose: { showQueue = false }, onExportAnotherVersion: reopen(from:))
                     .transition(.opacity)
@@ -138,7 +134,6 @@ private struct MainFlowView: View {
         // the mode-switch case in EditorView. Fading the editor in masks it
         // the same way.
         .animation(.easeInOut(duration: 0.35), value: sourceURL)
-        .animation(.easeInOut(duration: 0.35), value: showMergeFlow)
         .animation(.easeInOut(duration: 0.35), value: showQueue)
         .animation(.easeInOut(duration: 0.35), value: editorSessionID)
     }

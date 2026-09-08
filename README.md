@@ -1,9 +1,9 @@
 # MKV Clipper
 
-A tiny, single-purpose macOS app for cutting and merging `.mkv`/`.mp4` files.
-Drop in a file, pick a range, hit **Export** — or merge many whole files into
-one, with chapter markers, in a separate flow. No timeline, no filters, no
-re-encoding unless you ask for it.
+A tiny, single-purpose macOS app for cutting `.mkv`/`.mp4` files. Drop in a
+file, pick a range, hit **Export** — or queue up several exports and let
+them run one after another while you keep working. No timeline, no filters,
+no re-encoding unless you ask for it.
 
 Built for personal use and distributed only via this GitHub repo — it is
 not notarized or App Store–signed. The whole app lives in a fixed,
@@ -13,8 +13,8 @@ non-resizable 480×480 window.
 
 macOS's own media framework (AVFoundation) has no Matroska (`.mkv`) demuxer
 — it simply can't open these files. This app shells out to
-[ffmpeg](https://ffmpeg.org) (and `ffprobe`) to read, cut, and merge them
-instead. There's no way around this requirement on macOS.
+[ffmpeg](https://ffmpeg.org) (and `ffprobe`) to read and cut them instead.
+There's no way around this requirement on macOS.
 
 ### Install ffmpeg (one-time)
 
@@ -57,7 +57,7 @@ developer since it's only ad-hoc signed. Clear the quarantine flag once:
 xattr -dr com.apple.quarantine MKVClipper.app
 ```
 
-## Using it: clipping a single file
+## Using it
 
 1. Drag an `.mkv` or `.mp4` onto the window (or click **Choose File…**, or
    the **I know you have a .mp4 file** link if that's what you've got).
@@ -126,35 +126,26 @@ many fixed-length clips automatically — e.g. a 1-hour video into
 - **Force Stop** stops the whole batch — the clip in progress is killed and
   its partial file removed; clips already finished are left in place.
 
-## Using it: merging many files into one
+### Queueing multiple exports
 
-Click **Merge Multiple Files into One…** on the drop-zone screen (a separate
-flow from clipping — it doesn't need a file loaded first). Use case: you've
-downloaded a whole tutorial playlist as 100+ separate lesson files and want
-one file on disk, with each lesson reachable as a chapter marker your media
-player can jump between.
+On the Advanced Settings page of a **Single Clip** export, **Add to Queue**
+sits next to **Export**. Use it instead of Export to line up several exports
+— e.g. the same file at 1080p and again at 720p, or a different range each
+time — without waiting for one to finish before configuring the next.
 
-1. **Select Files** — drag in or **Add Files…** to pick many `.mkv`/`.mp4`
-   files at once. They're automatically ordered by any number in their
-   filename (natural sort — `[1] Intro.mp4`, `[2] Setup.mp4`, …), so name
-   your files sequentially before adding them if they aren't already; you can
-   also drag rows to reorder manually and edit each one's chapter title
-   inline. At least 2 files are required to continue.
-2. The app probes every file (video/audio codec, resolution, frame rate,
-   sample rate) and checks they're compatible for a lossless merge. If any
-   file doesn't match the others, a page lists exactly which files and which
-   property differ — merging only works when every file agrees, since this
-   is a pure stream-copy (no re-encode fallback in this version).
-3. **Output Settings** — name the merged file and choose MKV or MP4.
-   MKV chapters work in VLC (macOS & Android) but not in QuickTime Player;
-   MP4 works in both, so it's the default.
-4. Hit **Merge**. The combined file, with a chapter marker at every original
-   file's boundary (titled from that file's chapter title), lands in
-   `~/Downloads/MKV Clipper Exports`.
-
-This is a fast-path-only merge (ffmpeg's concat demuxer, stream copy) — it's
-lossless and fast, but it's why mismatched source files are rejected up front
-rather than silently producing a broken or re-encoded result.
+- Up to 10 exports at a time (1 running + 9 waiting); they run strictly one
+  after another, never in parallel, so quality and thermal behavior are
+  identical to a direct Export.
+- A small pill showing how many are queued appears on every page once
+  there's anything in the queue — tap it to open the Export Queue screen.
+  Tapping a running or finished job's row expands it in place for a closer
+  look; the badge itself always gets you back to the full list.
+- **Export Another Version of This File** (on a finished job's row, or on
+  the completed page after a direct Export) reopens that file with the same
+  range/format/quality/resolution already filled in, ready to tweak just one
+  thing and export again.
+- **Bulk Clip** isn't queueable — it already runs as its own batch within
+  one export.
 
 ## Notes
 
@@ -176,16 +167,16 @@ Sources/
   AppDelegate.swift       App-quit cleanup (kills any running ffmpeg exports)
   AppState.swift          Shared app-level state
   ContentView.swift        Top-level view: fixed 480×480 window, routes between
-                           the drop zone, the clip wizard, and the merge flow
-  DropZoneView.swift       The initial "drop a file" / "merge files" screen
+                           the drop zone, the clip wizard, and the export queue
+  DropZoneView.swift       The initial "drop a file here" screen
   EditorView.swift          Single Clip / Bulk Clip paged wizard
-  MergeClipsView.swift      Merge-many-files-into-one paged wizard
+  ExportQueue.swift         The export queue: sequential job execution engine
+  ExportQueueView.swift     The export queue's screen
   WizardComponents.swift    Page transition + progress/completed/stopped page
-                           views shared by both wizards
+                           views, and the queue-count pill, shared across
+                           the wizard and the queue screen
   Clipper.swift            Single-file clip/split export logic, ffmpeg process
                            orchestration, output-path/folder naming
-  ClipMerger.swift          Merge business logic: bounded-concurrency probing,
-                           compatibility checking, concat + chapter generation
   VideoProbe.swift          ffprobe-based metadata probing (duration, codecs,
                            resolution, frame rate, sample rate, …)
   FFmpegLocator.swift       Finds the user's ffmpeg/ffprobe install
