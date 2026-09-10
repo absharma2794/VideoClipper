@@ -41,7 +41,7 @@ struct FFmpegSetupView: View {
                 } label: {
                     Label(justCopied ? "Copied" : "Copy", systemImage: justCopied ? "checkmark" : "doc.on.doc")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.capsule)
             }
 
             Text("Don't have Homebrew? Install it first from brew.sh")
@@ -49,7 +49,7 @@ struct FFmpegSetupView: View {
                 .foregroundStyle(.secondary)
 
             Button("Re-check", action: onRecheck)
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.capsuleProminent)
                 .padding(.top, 4)
         }
         .padding(40)

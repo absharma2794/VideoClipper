@@ -21,10 +21,18 @@ enum Clipper {
 
         var id: String { rawValue }
 
+        // T2.5: "Same Quality"/"Smaller" were renamed once Tier 6 made them
+        // true -- both audit rounds measured the old hardware-encoder path
+        // *not* matching source quality, and "Smaller" sometimes losing to
+        // "Same Quality" on both size and VMAF at once. Shortened from the
+        // task list's "High quality (re-encoded)"/"Compact (re-encoded)" to
+        // fit this picker's segmented control; the fuller phrasing lives in
+        // the pre-export summary panel (`summaryLines`) instead, where
+        // there's room for it.
         var displayName: String {
             switch self {
-            case .smaller: return "Smaller"
-            case .same: return "Same Quality"
+            case .smaller: return "Compact"
+            case .same: return "High Quality"
             case .highestQuality: return "Highest Quality"
             }
         }
@@ -74,6 +82,35 @@ enum Clipper {
         let precise: Bool
         var qualityTier: QualityTier = .same
         var resolution: Resolution = .native
+        /// Which HEVC encoder a Precise export uses:
+        /// - `false` (default): `hevc_videotoolbox` -- Apple Silicon's
+        ///   fixed-function hardware encoder. Near-real-time, low power. The
+        ///   sane default for a laptop, especially on longer clips.
+        /// - `true`: `libx265 -preset slow` -- pure software. Roughly an
+        ///   order of magnitude slower and pins every CPU core for the whole
+        ///   run, but genuinely better quality-per-byte, so a re-encode is
+        ///   more likely to come out smaller than the source. Opt-in, for
+        ///   when the machine is plugged in and the wait is acceptable.
+        ///
+        /// Tier 6 (T6.2) originally made software the *only* path; that made
+        /// every Precise export a multi-minute, battery-draining operation,
+        /// so hardware is back as the default with software as a toggle.
+        var useSoftwareEncoder: Bool = false
+        /// Which audio tracks (by `VideoProbe.StreamTrack.typeIndex`) a
+        /// Precise export maps -- Tier 3's per-track selection, replacing
+        /// T1.1's "map every track" default with one a user actually
+        /// chose, or -- wherever a request is built without going through
+        /// the track picker -- `Clipper.defaultTrackSelection`'s "one
+        /// track matching system language" default. No default value here:
+        /// every call site has to pick one deliberately rather than
+        /// silently inherit "all tracks" or "none". Ignored by Fast
+        /// exports, which keep their own fixed map (see the guardrail
+        /// against changing Fast, TASKS-lossless.md).
+        var selectedAudioTracks: Set<Int>
+        /// Same idea as `selectedAudioTracks`, for subtitle tracks. An
+        /// empty set (Tier 3's own default) means "no subtitles," not
+        /// "fall back to something else" -- there's no separate nil case.
+        var selectedSubtitleTracks: Set<Int>
         /// Where the clip is written. `nil` means the general exports folder
         /// (`~/Downloads/MKV Clipper Exports`); `exportBatch` sets this to a
         /// shared per-session subfolder so every clip in a Bulk Clip run lands
@@ -86,6 +123,11 @@ enum Clipper {
         /// True if, when exporting to MP4, the audio track couldn't be stream-copied
         /// and was re-encoded to AAC instead. Surfaced so the quality change is never silent.
         let usedAudioReencodeFallback: Bool
+        /// Non-fatal notices about what changed during export -- e.g. a subtitle
+        /// track dropped because its codec can't convert into the target
+        /// container. Empty when there's nothing to report. Surfaced so a
+        /// dropped track is never silent (TASKS-lossless.md T1.1).
+        let warnings: [String]
     }
 
     enum ExportError: LocalizedError {
@@ -119,14 +161,46 @@ enum Clipper {
         let outputURL = try uniqueOutputURL(in: directory, for: request.sourceURL, start: request.start, end: request.end, format: request.format, resolution: request.resolution)
 
         if request.precise {
-            let args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL)
+            // T1.1: figure out up front which subtitle tracks the target
+            // container can actually carry -- MKV keeps everything, MP4
+            // only text-based codecs it can convert to mov_text. Whatever's
+            // left out is reported back, never dropped silently.
+            let subtitlePlan = subtitlePlan(sourceInfo: request.sourceInfo, outputFormat: request.format, selection: request.selectedSubtitleTracks)
+            let warnings = subtitlePlan.droppedDescriptions.map {
+                "Dropped subtitle track (\($0)) -- its format can't convert into \(request.format.displayName)."
+            }
+
+            // T1.2: try a native audio copy first. Mirrors the Fast path's
+            // own MP4 fallback below exactly -- an incompatible codec in an
+            // MP4 mux (e.g. AC-3) is rejected essentially immediately, not
+            // after most of the (much slower, re-encoded) video has already
+            // been processed, so retrying the whole invocation costs little.
+            let args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL, subtitlePlan: subtitlePlan, reencodeAudio: false)
             do {
                 try await runFFmpeg(tools.ffmpeg, args, totalDuration: clipDuration, onProgress: onProgress)
+                return Result(outputURL: outputURL, usedAudioReencodeFallback: false, warnings: warnings)
+            } catch ExportError.cancelled {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw ExportError.cancelled
             } catch {
-                try? FileManager.default.removeItem(at: outputURL) // don't leave a partial/cancelled file behind
-                throw error
+                // Only worth retrying with a transcode if audio was
+                // actually mapped in the first place -- Tier 3 lets the
+                // user deselect every audio track, in which case a failure
+                // here has nothing to do with audio codec compatibility.
+                guard request.format == .mp4, !request.selectedAudioTracks.isEmpty else {
+                    try? FileManager.default.removeItem(at: outputURL)
+                    throw clarifyBitDepthFailure(error, pixFmt: request.sourceInfo.pixFmt)
+                }
+                try? FileManager.default.removeItem(at: outputURL) // clean up any partial output
+                let fallbackArgs = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL, subtitlePlan: subtitlePlan, reencodeAudio: true)
+                do {
+                    try await runFFmpeg(tools.ffmpeg, fallbackArgs, totalDuration: clipDuration, onProgress: onProgress)
+                } catch {
+                    try? FileManager.default.removeItem(at: outputURL)
+                    throw clarifyBitDepthFailure(error, pixFmt: request.sourceInfo.pixFmt)
+                }
+                return Result(outputURL: outputURL, usedAudioReencodeFallback: true, warnings: warnings)
             }
-            return Result(outputURL: outputURL, usedAudioReencodeFallback: false)
         }
 
         // Fast (stream-copy) path: ffmpeg can only start a copied stream at an
@@ -148,7 +222,7 @@ enum Clipper {
         let copyArgs = fastCopyArguments(request: request, seekStart: seekStart, clipDuration: copyDuration, outputURL: outputURL, reencodeAudio: false)
         do {
             try await runFFmpeg(tools.ffmpeg, copyArgs, totalDuration: copyDuration, onProgress: onProgress)
-            return Result(outputURL: outputURL, usedAudioReencodeFallback: false)
+            return Result(outputURL: outputURL, usedAudioReencodeFallback: false, warnings: [])
         } catch ExportError.cancelled {
             // Never retry a user-requested stop -- just clean up and propagate.
             try? FileManager.default.removeItem(at: outputURL)
@@ -168,7 +242,7 @@ enum Clipper {
                 try? FileManager.default.removeItem(at: outputURL)
                 throw error
             }
-            return Result(outputURL: outputURL, usedAudioReencodeFallback: true)
+            return Result(outputURL: outputURL, usedAudioReencodeFallback: true, warnings: [])
         }
     }
 
@@ -247,6 +321,12 @@ enum Clipper {
             in: exportsBaseFolder()
         )
 
+        // Bulk Clip has no track-picker UI (Tier 3's checklist is Single
+        // Clip only), so every clip in the batch uses the same computed
+        // default rather than "every track" -- resolved once up front
+        // since it depends only on the source, not the interval.
+        let defaultTracks = defaultTrackSelection(sourceInfo: sourceInfo)
+
         var outputURLs: [URL] = []
         for (index, interval) in intervals.enumerated() {
             do {
@@ -258,6 +338,7 @@ enum Clipper {
             let request = Request(
                 sourceURL: sourceURL, sourceInfo: sourceInfo, start: interval.start, end: interval.end,
                 format: format, precise: true, qualityTier: qualityTier, resolution: resolution,
+                selectedAudioTracks: defaultTracks.audio, selectedSubtitleTracks: defaultTracks.subtitles,
                 outputDirectory: sessionFolder
             )
             do {
@@ -282,7 +363,7 @@ enum Clipper {
     /// available or the lookup fails -- fast-copy exports may then overshoot
     /// the requested end on sparse-keyframe sources, but the app still
     /// functions with ffmpeg alone.
-    private static func nearestKeyframeTimestamp(atOrBefore target: Double, sourceURL: URL, tools: FFmpegLocator.Tools) async -> Double {
+    static func nearestKeyframeTimestamp(atOrBefore target: Double, sourceURL: URL, tools: FFmpegLocator.Tools) async -> Double {
         guard target > 0, let ffprobePath = tools.ffprobe else { return max(target, 0) }
         let arguments = [
             "-v", "error",
@@ -367,34 +448,168 @@ enum Clipper {
         return args
     }
 
-    private static func preciseArguments(request: Request, clipDuration: Double, outputURL: URL) -> [String] {
+    /// Subtitle codecs ffmpeg can convert into MP4's `mov_text` -- text-based
+    /// formats only. Image-based subtitle codecs (PGS/VobSub/DVB) can't:
+    /// ffmpeg errors outright if asked ("Subtitle encoding currently only
+    /// possible from text to text or bitmap to bitmap"). Those tracks are
+    /// excluded from the MP4 map entirely instead (T1.1), with a warning
+    /// surfaced in `Result.warnings` rather than a silent drop.
+    private static let mp4ConvertibleSubtitleCodecs: Set<String> = [
+        "subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text",
+    ]
+
+    private struct SubtitlePlan {
+        /// Ordinal indices (0-based among subtitle streams, i.e. the `n` in
+        /// an `0:s:n` stream specifier) to include in the export's `-map` list.
+        let mappedOrdinals: [Int]
+        /// Descriptions of subtitle tracks left out because their codec
+        /// can't convert into the target container -- always empty for MKV,
+        /// which keeps everything.
+        let droppedDescriptions: [String]
+    }
+
+    /// MKV keeps every *selected* subtitle track (`-c:s copy` handles
+    /// essentially any subtitle codec natively); MP4 additionally drops
+    /// whichever selected tracks `mp4ConvertibleSubtitleCodecs` can't
+    /// convert. Convertibility is determined up front from already-probed
+    /// codec names, rather than by trial-and-error against ffmpeg -- unlike
+    /// the audio codec fallback below, there's no need to run ffmpeg at all
+    /// to know this per-track compatibility ahead of time. `selection` is
+    /// Tier 3's track picker (by `typeIndex`); a track left out of
+    /// `selection` is simply not mapped at all, and doesn't appear in
+    /// `droppedDescriptions` -- that list is only for a track the user
+    /// *did* want that couldn't make it into the container, since only
+    /// those need a warning.
+    private static func subtitlePlan(sourceInfo: VideoProbe.Info, outputFormat: OutputFormat, selection: Set<Int>) -> SubtitlePlan {
+        let selectedStreams = sourceInfo.subtitleStreams.filter { selection.contains($0.typeIndex) }
+        guard outputFormat == .mp4 else {
+            return SubtitlePlan(mappedOrdinals: selectedStreams.map { $0.typeIndex }, droppedDescriptions: [])
+        }
+        var mapped: [Int] = []
+        var dropped: [String] = []
+        for stream in selectedStreams {
+            if mp4ConvertibleSubtitleCodecs.contains(stream.codec.lowercased()) {
+                mapped.append(stream.typeIndex)
+            } else {
+                dropped.append(stream.displayName)
+            }
+        }
+        return SubtitlePlan(mappedOrdinals: mapped, droppedDescriptions: dropped)
+    }
+
+    /// Tier 3's sensible default track selection: one audio track matching
+    /// the system's preferred language (falling back to the first audio
+    /// track if none match), and subtitles off. Used wherever a request is
+    /// built without going through the track-picker UI (Bulk Clip, which
+    /// has no picker at all) -- deliberately not "every track" (T1.1's own
+    /// mechanical default, which is still what an *empty* source-language
+    /// list falls back to) or "first track only," both of which either
+    /// bloat every export with tracks nobody asked for or silently miss the
+    /// one a non-English speaker actually wants.
+    static func defaultTrackSelection(sourceInfo: VideoProbe.Info) -> (audio: Set<Int>, subtitles: Set<Int>) {
+        guard sourceInfo.hasAudio else { return (audio: [], subtitles: []) }
+        let preferredLanguages = Locale.preferredLanguages.compactMap { Locale(identifier: $0).language.languageCode?.identifier }
+        let matched = sourceInfo.audioStreams.first { stream in
+            guard let language = stream.language else { return false }
+            return preferredLanguages.contains { language.lowercased().hasPrefix($0.lowercased()) }
+        }
+        let defaultIndex = matched?.typeIndex ?? sourceInfo.audioStreams.first?.typeIndex ?? 0
+        return (audio: [defaultIndex], subtitles: [])
+    }
+
+    /// Rewrites a raw ffmpeg failure into a clearer one when it looks like a
+    /// 10-bit/bit-depth rejection from the chosen encoder (T1.5's "fail
+    /// loudly" requirement). There's no reliable static way to ask an
+    /// encoder like `hevc_videotoolbox` whether it supports 10-bit input on
+    /// this particular Mac -- Apple doesn't expose that as a capability
+    /// query -- so this recognizes the failure after the fact from ffmpeg's
+    /// own stderr instead of trying to predict it up front. Falls through
+    /// completely unchanged for every other kind of failure; it only adds
+    /// context, never hides the original detail.
+    private static func clarifyBitDepthFailure(_ error: Error, pixFmt: String?) -> Error {
+        guard let pixFmt, pixFmt.lowercased().contains("10"),
+              case ExportError.ffmpegFailed(let detail) = error else { return error }
+        let lower = detail.lowercased()
+        guard lower.contains("pix_fmt") || lower.contains("pixel format") || lower.contains("p010") || lower.contains("unsupported") else {
+            return error
+        }
+        return ExportError.ffmpegFailed(
+            "The hardware encoder can't produce 10-bit output on this Mac, so the export was stopped instead of silently dropping to 8-bit. Turn on \"Use software encoder\" in Advanced Settings — libx265 handles 10-bit — or pick an 8-bit output.\n\n\(detail)"
+        )
+    }
+
+    private static func preciseArguments(request: Request, clipDuration: Double, outputURL: URL, subtitlePlan: SubtitlePlan, reencodeAudio: Bool) -> [String] {
         var args = [
             "-hide_banner", "-y",
             "-ss", String(request.start),
             "-i", request.sourceURL.path,
             "-t", String(clipDuration),
-            "-map", "0:v:0", "-map", "0:a:0?",
         ]
 
-        args += videoEncodingArguments(tier: request.qualityTier, sourceInfo: request.sourceInfo, outputFormat: request.format)
-        args += ["-c:a", "aac", "-b:a", "192k"]
+        // T1.1: map every real video stream (`V` excludes embedded cover
+        // art -- see T1.7/VideoProbe). Audio and subtitle tracks are
+        // mapped individually per Tier 3's selection (`request.selected*`)
+        // rather than a blanket "every track" -- replacing the original
+        // hard-coded "first video, first audio, nothing else," which
+        // silently dropped every extra audio track and all subtitles (42
+        // lost on one of the audit's sources), without going all the way
+        // to the opposite extreme of always keeping every track a source
+        // happens to carry.
+        args += ["-map", "0:V"]
+        for ordinal in request.selectedAudioTracks.sorted() {
+            args += ["-map", "0:a:\(ordinal)"]
+        }
+        for ordinal in subtitlePlan.mappedOrdinals {
+            args += ["-map", "0:s:\(ordinal)"]
+        }
 
-        // Force a keyframe every 2 seconds, regardless of source framerate or
-        // which encoder the quality tier picked. Without this, libx264 falls
-        // back to its default 250-frame GOP -- fine at low framerates, but on
-        // a 60fps source that's a keyframe every ~4.17s. Players can only
-        // resume playback at a keyframe after a seek, so a multi-second GOP
-        // produces exactly what it sounds like: seeking forward/back in the
-        // exported clip stalls (audio drops out) for up to that long while it
-        // waits for/decodes forward to the next keyframe. The time-based
-        // "expr:gte(t,n_forced*2)" form (vs. a fixed frame-count -g) stays
-        // correct regardless of the source's actual framerate.
-        args += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
+        args += videoEncodingArguments(tier: request.qualityTier, outputFormat: request.format, useSoftwareEncoder: request.useSoftwareEncoder)
 
+        // T1.2: copy audio natively instead of always transcoding to a fixed
+        // 192k AAC -- measured to have halved one source's bitrate and
+        // forced a lossy generational transcode on another, for no measured
+        // benefit. MP4 can't legally carry every codec (e.g. AC-3), so this
+        // still falls back to AAC there, same as the Fast path's own MP4
+        // fallback (see the retry in `export(_:tools:onProgress:)`).
+        if !request.selectedAudioTracks.isEmpty {
+            args += reencodeAudio ? ["-c:a", "aac", "-b:a", "192k"] : ["-c:a", "copy"]
+        }
+
+        if !subtitlePlan.mappedOrdinals.isEmpty {
+            args += request.format == .mp4 ? ["-c:s", "mov_text"] : ["-c:s", "copy"]
+        }
+
+        // T1.6: carry chapters and global metadata through, matching what
+        // the Fast path already gets for free via `-c copy`.
+        args += ["-map_chapters", "0", "-map_metadata", "0"]
+
+        // Force a keyframe roughly every 6 seconds, regardless of source
+        // framerate or which encoder the quality tier picked. Without any
+        // forced interval, libx264/libx265 fall back to their own default
+        // GOP (250 frames -- ~4s at 60fps, 10+s at 24fps), and a multi-
+        // second GOP means seeking in the exported clip stalls (in any
+        // player, not just this app) for up to that long while it decodes
+        // forward to the next keyframe. 6s is a deliberately relaxed
+        // interim value (was a hard-coded 2s, fighting every encoder's own
+        // scene-cut placement for no real benefit on a local file) --
+        // TASKS-lossless.md T1.4 flags this as worth re-tuning empirically
+        // once Tier 6's encoder swap lands, not a number to treat as final.
+        // The time-based "expr:gte(t,n_forced*6)" form (vs. a fixed
+        // frame-count -g) stays correct regardless of the source's actual
+        // framerate.
+        args += ["-force_key_frames", "expr:gte(t,n_forced*6)"]
+
+        // T1.5: keep the source's own bit depth through both the direct-
+        // encode and scale-filter paths instead of letting either fall back
+        // to 8-bit silently. Only forced for a 10-bit source -- an 8-bit
+        // source already gets each encoder's normal 8-bit default with
+        // nothing to preserve.
+        let sourceIs10Bit = (request.sourceInfo.pixFmt ?? "").lowercased().contains("10")
+        var filters: [String] = []
         if let targetHeight = request.resolution.targetHeight {
             // scale=-2:H keeps the source's aspect ratio, computing width automatically
             // (rounded to an even number, required by most encoders).
-            args += ["-vf", "scale=-2:\(targetHeight)"]
+            filters.append("scale=-2:\(targetHeight)")
         } else if request.sourceInfo.width % 2 != 0 || request.sourceInfo.height % 2 != 0 {
             // Native resolution requested, but the source has an odd dimension.
             // libx264 tolerates that; hevc_videotoolbox (the "Smaller" tier)
@@ -402,7 +617,21 @@ enum Clipper {
             // filter and no error, rather than failing loudly. Make that
             // rounding explicit and identical across every tier instead of
             // leaving it to an undocumented per-encoder default.
-            args += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+            filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        }
+        if sourceIs10Bit, let pixFmt = request.sourceInfo.pixFmt {
+            // Forces the filter chain (and, through it, the encoder's own
+            // input) to keep the source's exact pixel format instead of
+            // letting an implicit conversion settle on an 8-bit
+            // intermediate. If the chosen encoder genuinely can't take this
+            // format as input, ffmpeg now fails loudly here rather than
+            // silently downconverting -- `clarifyBitDepthFailure` above
+            // turns that failure into a clear message instead of a raw
+            // ffmpeg stderr dump.
+            filters.append("format=\(pixFmt)")
+        }
+        if !filters.isEmpty {
+            args += ["-vf", filters.joined(separator: ",")]
         }
         if request.format == .mp4 {
             args += ["-movflags", "+faststart"]
@@ -411,40 +640,171 @@ enum Clipper {
         return args
     }
 
-    /// Picks the encoder and quality/bitrate target for each tier.
+    /// Picks the HEVC encoder and its constant-quality target for each tier.
     ///
-    /// - `.smaller` always uses hardware HEVC (Apple's VideoToolbox encoder):
-    ///   verified ~7x smaller than H.264 CRF 18 at comparable visual quality,
-    ///   at similar or better speed since it's hardware-accelerated.
-    /// - `.same` matches the source's own codec family and targets its
-    ///   measured bitrate, so a shorter clip comes out proportionally smaller
-    ///   -- verified this reproduces close to the source's own size/quality
-    ///   ratio. Falls back to a reasonable fixed quality setting if the
-    ///   source's bitrate couldn't be determined (some containers omit it).
-    /// - `.highestQuality` is the original fixed H.264 CRF 18 behavior:
-    ///   prioritizes quality/precision and accepts the largest files.
-    private static func videoEncodingArguments(tier: QualityTier, sourceInfo: VideoProbe.Info, outputFormat: OutputFormat) -> [String] {
+    /// T6.1 deletes the old `-b:v` average-bitrate path entirely (on both
+    /// encoders): a whole-file average bitrate is the wrong control variable
+    /// for an arbitrary clip, and it wasn't a close call -- on the 10-bit
+    /// audit source, a constant-quality export beat the `-b:v` export on
+    /// **both** size and VMAF simultaneously (94.6 vs 91.1 VMAF, 91.2 vs
+    /// 95.6 MB) with that one variable changed. Both encoder paths below are
+    /// constant-quality now, so a shorter clip just costs less, the same
+    /// way a lossless copy does.
+    ///
+    /// **Encoder choice (`useSoftwareEncoder`):**
+    ///
+    /// - **`hevc_videotoolbox` (default, `useSoftwareEncoder == false`)** --
+    ///   Apple Silicon's fixed-function hardware encoder. Near-real-time,
+    ///   negligible power draw. T6.2 had removed this as the default in
+    ///   favour of software x265; that turned every Precise export into a
+    ///   multi-minute, all-cores-pinned, battery-draining job (a full-length
+    ///   re-encode ran ~1 hour vs. ~5 minutes on the hardware path), so it's
+    ///   back as the default. `-q:v` here is VideoToolbox's 0-100 quality
+    ///   scale (higher = better); the values are approximate tier anchors,
+    ///   not VMAF-measured -- the hardware `-q:v` scale is non-linear and
+    ///   driver-dependent, so it can't be tuned the way CRF can. `.same`'s
+    ///   65 matches what the app shipped with pre-Tier-6.
+    /// - **`libx265 -preset slow` (`useSoftwareEncoder == true`)** -- pure
+    ///   software, ~10x slower, but a real generation ahead in
+    ///   rate-distortion, so a re-encode is much more likely to come out
+    ///   smaller than the source (the hardware path is why "Smaller"
+    ///   sometimes came out *bigger* in the original audits). CRF values
+    ///   were verified against this branch's Tier 6 gate (VMAF via `libvmaf`
+    ///   on a low-motion 4:2:0 source and a harder detail-heavy 4:4:4 one):
+    ///   - `.highestQuality`: CRF 16 -- effectively transparent (97.3/97.3).
+    ///   - `.same`: CRF 18 -- 97.3/96.3 VMAF, comfortably above the tier's
+    ///     ≥95 gate on both (CRF 20 was tried first and measured 94.93 on
+    ///     the harder source -- below the gate -- which is why it re-tests
+    ///     against more than one source).
+    ///   - `.smaller`: CRF 26 -- reliably smaller *and* lower-VMAF than
+    ///     `.same` on both sources (96.4/87.8), fixing the VMAF inversion
+    ///     the original audits found.
+    private static func videoEncodingArguments(tier: QualityTier, outputFormat: OutputFormat, useSoftwareEncoder: Bool) -> [String] {
         let hevcTag = outputFormat == .mp4 ? ["-tag:v", "hvc1"] : [] // QuickTime/Finder expect 'hvc1', not ffmpeg's default 'hev1'
-
-        switch tier {
-        case .smaller:
-            return ["-c:v", "hevc_videotoolbox", "-q:v", "60"] + hevcTag
-        case .same:
-            let sourceIsHEVC = sourceInfo.videoCodec.lowercased().contains("hevc") || sourceInfo.videoCodec.lowercased().contains("265")
-            if sourceIsHEVC {
-                if let bitrate = sourceInfo.videoBitrate {
-                    return ["-c:v", "hevc_videotoolbox", "-b:v", "\(bitrate)"] + hevcTag
-                }
-                return ["-c:v", "hevc_videotoolbox", "-q:v", "65"] + hevcTag
-            } else {
-                if let bitrate = sourceInfo.videoBitrate {
-                    return ["-c:v", "libx264", "-preset", "veryfast", "-b:v", "\(bitrate)"]
-                }
-                return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+        if useSoftwareEncoder {
+            let crf: Int
+            switch tier {
+            case .highestQuality: crf = 16
+            case .same: crf = 18
+            case .smaller: crf = 26
             }
-        case .highestQuality:
-            return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+            return ["-c:v", "libx265", "-preset", "slow", "-crf", "\(crf)"] + hevcTag
+        } else {
+            let quality: Int
+            switch tier {
+            case .highestQuality: quality = 78
+            case .same: quality = 65
+            case .smaller: quality = 50
+            }
+            return ["-c:v", "hevc_videotoolbox", "-q:v", "\(quality)"] + hevcTag
         }
+    }
+
+    // MARK: - Pre-export visibility (T2.1/T2.2)
+
+    /// A short, human-readable line per stream describing what a
+    /// Precise/Fast export will actually do -- the "what Clipper already
+    /// knows" the pre-export summary panel surfaces before the user commits
+    /// to an export whose shape would otherwise stay hidden behind the UI
+    /// until it's already running.
+    static func summaryLines(for request: Request) -> [String] {
+        var lines: [String] = []
+        if request.precise {
+            let encoderArgs = videoEncodingArguments(tier: request.qualityTier, outputFormat: request.format, useSoftwareEncoder: request.useSoftwareEncoder)
+            let engine = request.useSoftwareEncoder ? "software x265, slow" : "hardware, fast"
+            lines.append("Video: \(describeEncoderArgs(encoderArgs)) → re-encoded (\(engine))")
+        } else {
+            // T2.5: "Fast" renamed to "Lossless" here -- this is the app's
+            // only genuinely bit-exact path, and both audit rounds found
+            // the old "Same Quality" Precise tier didn't actually earn that
+            // name, which made "Fast" the odd one out for actually meaning
+            // what it said. Keeping "keyframe-aligned cut" alongside it so
+            // the one real tradeoff (the snapped start, see T2.3 above) is
+            // still named, not just "lossless" on its own.
+            lines.append("Video: copied (Lossless, keyframe-aligned cut)")
+        }
+
+        if !request.sourceInfo.hasAudio {
+            lines.append("Audio: none")
+        } else if request.precise {
+            // Tier 3: reflects whichever tracks are actually selected,
+            // not just "the source has audio" -- a user can deselect all
+            // of them, or keep more than one.
+            let count = request.selectedAudioTracks.count
+            lines.append(count == 0 ? "Audio: none selected" : "Audio: \(count) track\(count == 1 ? "" : "s") → copied")
+        } else {
+            lines.append("Audio: \(request.sourceInfo.audioCodec?.uppercased() ?? "unknown") → copied (Lossless)")
+        }
+
+        let subtitleStreams = request.sourceInfo.subtitleStreams
+        if subtitleStreams.isEmpty {
+            lines.append("Subtitles: none")
+        } else if request.precise {
+            let plan = subtitlePlan(sourceInfo: request.sourceInfo, outputFormat: request.format, selection: request.selectedSubtitleTracks)
+            if plan.mappedOrdinals.isEmpty, plan.droppedDescriptions.isEmpty {
+                lines.append("Subtitles: none selected")
+            } else if plan.droppedDescriptions.isEmpty {
+                lines.append("Subtitles: \(plan.mappedOrdinals.count) track\(plan.mappedOrdinals.count == 1 ? "" : "s") → copied")
+            } else {
+                lines.append("Subtitles: \(plan.mappedOrdinals.count) copied, \(plan.droppedDescriptions.count) dropped (format can't convert to \(request.format.displayName))")
+            }
+        } else {
+            lines.append("Subtitles: \(subtitleStreams.count) track\(subtitleStreams.count == 1 ? "" : "s") → copied (Lossless)")
+        }
+
+        lines.append("Chapters: \(request.sourceInfo.hasChapters ? "copied" : "none")")
+        return lines
+    }
+
+    /// Pulls a plain-English "codec, quality setting" description out of an
+    /// already-built `-c:v ...` argument list, rather than re-deriving the
+    /// tier/codec decision a second time -- `videoEncodingArguments` stays
+    /// the single place that logic lives.
+    private static func describeEncoderArgs(_ args: [String]) -> String {
+        func value(after flag: String) -> String? {
+            guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
+            return args[index + 1]
+        }
+        let codec = value(after: "-c:v") ?? "unknown"
+        let codecName = (codec.contains("264")) ? "H.264" : ((codec.contains("265") || codec.contains("hevc")) ? "HEVC" : codec)
+        if let crf = value(after: "-crf") { return "\(codecName), CRF \(crf)" }
+        if let q = value(after: "-q:v") { return "\(codecName), Q\(q)" }
+        if let bitrate = value(after: "-b:v"), let bps = Int(bitrate) { return "\(codecName), ~\(bps / 1000) kbps" }
+        return codecName
+    }
+
+    /// Builds the exact ffmpeg invocation `export(_:tools:onProgress:)`
+    /// would run for `request` on its first attempt (not a retry/fallback
+    /// variant), as a shell-quoted, copy-pasteable string -- the "Copy
+    /// ffmpeg command" button (T2.1), so the exact command this app runs is
+    /// never hidden behind the UI. Async because the Fast path needs the
+    /// same keyframe lookup `export` itself performs to know its real start.
+    static func previewCommandLine(for request: Request, tools: FFmpegLocator.Tools) async -> String {
+        let clipDuration = request.end - request.start
+        guard clipDuration > 0 else { return "" }
+        let directory = (try? request.outputDirectory ?? exportsBaseFolder())
+        let outputURL = directory.flatMap { try? uniqueOutputURL(in: $0, for: request.sourceURL, start: request.start, end: request.end, format: request.format, resolution: request.resolution) }
+            ?? request.sourceURL.deletingLastPathComponent().appendingPathComponent("output.\(request.format.rawValue)")
+
+        let args: [String]
+        if request.precise {
+            let plan = subtitlePlan(sourceInfo: request.sourceInfo, outputFormat: request.format, selection: request.selectedSubtitleTracks)
+            args = preciseArguments(request: request, clipDuration: clipDuration, outputURL: outputURL, subtitlePlan: plan, reencodeAudio: false)
+        } else {
+            let seekStart = await nearestKeyframeTimestamp(atOrBefore: request.start, sourceURL: request.sourceURL, tools: tools)
+            args = fastCopyArguments(request: request, seekStart: seekStart, clipDuration: request.end - seekStart, outputURL: outputURL, reencodeAudio: false)
+        }
+        return (["ffmpeg"] + args).map(shellQuoted).joined(separator: " ")
+    }
+
+    /// Quotes an argument for safe pasting into a shell, only when it
+    /// actually needs it -- most ffmpeg flags and simple paths are left
+    /// bare so the copied command stays easy to read.
+    private static func shellQuoted(_ argument: String) -> String {
+        if argument.isEmpty { return "''" }
+        let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:")
+        if argument.unicodeScalars.allSatisfy({ safe.contains($0) }) { return argument }
+        return "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: - Output path

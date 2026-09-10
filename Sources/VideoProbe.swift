@@ -9,10 +9,13 @@ enum VideoProbe {
         let width: Int
         let height: Int
         let videoCodec: String
-        /// Video-stream bitrate in bits/sec, when the container declares one.
-        /// Used to target a "Same quality" re-encode at roughly the source's
-        /// own efficiency. Not all containers report this (notably some MKVs),
-        /// so callers must handle nil.
+        /// Video-stream bitrate in bits/sec. When the container declares a
+        /// per-stream value, that's used as-is; when it doesn't (notably
+        /// many MKVs), this is estimated from actual packet sizes rather
+        /// than falling back to the container's total bitrate, which mixes
+        /// in audio/subtitle bytes and can overstate the video's own share
+        /// by a double-digit percentage (see TASKS-lossless.md T1.3). Still
+        /// nil if even that estimate couldn't be produced.
         let videoBitrate: Int?
         /// nil when `hasAudio` is false. Used to compare audio compatibility
         /// across multiple source files before a stream-copy merge.
@@ -37,6 +40,49 @@ enum VideoProbe {
         let audioSampleRate: Int?
         /// nil when `hasAudio` is false or unavailable.
         let audioChannels: Int?
+        /// The primary video stream's pixel format, e.g. "yuv420p10le" for a
+        /// 10-bit source vs. "yuv420p" for 8-bit. nil when unavailable (only
+        /// the ffmpeg-stderr fallback probe below lacks this). Lets
+        /// `Clipper` guard against a 10-bit source silently losing bit depth
+        /// on an encoder or scale filter that defaults to 8-bit output.
+        let pixFmt: String?
+        /// Every audio stream in the source, in container order -- not just
+        /// the first/default one `audioCodec` above describes. `typeIndex`
+        /// on each is the value that slots into an `0:a:<n>` stream
+        /// specifier. Used by the Tier 3 track-selection checklist and by
+        /// `Clipper`'s track mapping, which need to reason about every
+        /// track, not only the default.
+        let audioStreams: [StreamTrack]
+        /// Every subtitle stream in the source. Empty (not nil) when there
+        /// are none, which is most sources.
+        let subtitleStreams: [StreamTrack]
+        /// True when the source has chapter markers to preserve.
+        /// Informational only (surfaced in the pre-export summary panel).
+        let hasChapters: Bool
+    }
+
+    /// One audio or subtitle stream as reported by ffprobe -- enough to both
+    /// describe it in a UI list (Tier 3's track checklist) and reason about
+    /// export compatibility (e.g. deciding per-stream whether a subtitle
+    /// codec can convert to MP4's `mov_text`).
+    struct StreamTrack: Identifiable {
+        /// 0-based position among streams of this same type -- the value
+        /// that slots into an `0:a:<n>`/`0:s:<n>` stream specifier. Not the
+        /// container-wide absolute index ffprobe also reports.
+        let typeIndex: Int
+        let codec: String
+        let language: String?
+        let title: String?
+
+        var id: Int { typeIndex }
+
+        var displayName: String {
+            var parts: [String] = []
+            if let language, !language.isEmpty, language.lowercased() != "und" { parts.append(language) }
+            parts.append(codec.uppercased())
+            if let title, !title.isEmpty { parts.append("\"\(title)\"") }
+            return parts.joined(separator: " · ")
+        }
     }
 
     enum ProbeError: LocalizedError {
@@ -65,92 +111,176 @@ enum VideoProbe {
 
     // MARK: - ffprobe path (preferred: fast, structured output)
 
+    /// One JSON query covers format duration, every stream (video/audio/
+    /// subtitle), and chapter presence -- replacing three separate flat
+    /// `key=value` queries. JSON (rather than the old
+    /// `default=noprint_wrappers=1`) is what makes this possible: that flat
+    /// format has no way to delimit multiple same-shaped stream blocks, so
+    /// it only ever worked because the old queries used `-select_streams
+    /// v:0`/`a:0` to guarantee exactly one match. Selecting every stream at
+    /// once (needed for T1.1's full track mapping and the Tier 3 track
+    /// list) needs a format that actually distinguishes stream boundaries.
     private static func probeWithFFprobe(url: URL, ffprobePath: String) async throws -> Info {
-        let durationOutput = try await run(
+        let output = try await run(
             executable: ffprobePath,
             arguments: [
                 "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-show_entries", "format=duration:stream=index,codec_type,codec_name,width,height,bit_rate,duration,r_frame_rate,pix_fmt,sample_rate,channels:stream_tags=language,title:stream_disposition=attached_pic",
+                "-show_chapters",
+                "-of", "json",
                 url.path,
             ]
         )
-        guard let duration = Double(durationOutput.trimmingCharacters(in: .whitespacesAndNewlines)),
+        guard let data = output.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ProbeError.processFailed("Couldn't parse ffprobe's output.")
+        }
+
+        guard let duration = doubleValue(((root["format"] as? [String: Any])?["duration"])),
               duration.isFinite, duration > 0 else {
             throw ProbeError.durationNotFound
         }
 
-        let audioOutput = try await run(
-            executable: ffprobePath,
-            arguments: [
-                "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name,duration,sample_rate,channels",
-                "-of", "default=noprint_wrappers=1",
-                url.path,
-            ]
-        )
-        let audioFields = parseKeyValueFields(audioOutput)
-        let hasAudio = audioFields["codec_name"] != nil
-        let audioCodec = audioFields["codec_name"]
-        let audioStreamDurationSeconds = Double(audioFields["duration"] ?? "")
-        let audioSampleRate = Int(audioFields["sample_rate"] ?? "")
-        let audioChannels = Int(audioFields["channels"] ?? "")
+        let hasChapters = !((root["chapters"] as? [[String: Any]] ?? []).isEmpty)
+        let streams = root["streams"] as? [[String: Any]] ?? []
 
-        // key=value lines (default=noprint_wrappers=1) parse robustly regardless
-        // of which fields are actually present -- some containers omit bit_rate.
-        let videoOutput = try await run(
-            executable: ffprobePath,
-            arguments: [
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,codec_name,bit_rate,duration,r_frame_rate",
-                "-of", "default=noprint_wrappers=1",
-                url.path,
-            ]
-        )
-        let videoFields = parseKeyValueFields(videoOutput)
-        let width = Int(videoFields["width"] ?? "") ?? 0
-        let height = Int(videoFields["height"] ?? "") ?? 0
-        let videoCodec = videoFields["codec_name"] ?? "unknown"
-        let videoStreamDurationSeconds = Double(videoFields["duration"] ?? "")
-        let videoFrameRate = parseFrameRateFraction(videoFields["r_frame_rate"])
-        var videoBitrate = Int(videoFields["bit_rate"] ?? "")
+        let videoStreams = streams.filter { (stringValue($0["codec_type"]) ?? "") == "video" }
+        // Exclude embedded cover art (a video-typed stream flagged
+        // `attached_pic`) from being picked as the primary video stream --
+        // T1.7. A file whose first video stream is cover art would
+        // otherwise probe as a 0x0 "video," misfiring resolution matching,
+        // the bitrate estimate below, and the scale filter.
+        let primaryVideo = videoStreams.first(where: { !isAttachedPic($0) }) ?? videoStreams.first ?? [:]
+
+        let width = intValue(primaryVideo["width"]) ?? 0
+        let height = intValue(primaryVideo["height"]) ?? 0
+        let videoCodec = stringValue(primaryVideo["codec_name"]) ?? "unknown"
+        let pixFmt = stringValue(primaryVideo["pix_fmt"])
+        let videoStreamDurationSeconds = doubleValue(primaryVideo["duration"])
+        let videoFrameRate = parseFrameRateFraction(stringValue(primaryVideo["r_frame_rate"]))
+        var videoBitrate = intValue(primaryVideo["bit_rate"])
 
         // Some containers (notably several MKVs) don't declare a per-stream
-        // bit_rate; fall back to the container-level bit_rate as an estimate.
-        if videoBitrate == nil {
-            let formatBitrateOutput = try? await run(
-                executable: ffprobePath,
-                arguments: [
-                    "-v", "error",
-                    "-show_entries", "format=bit_rate",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    url.path,
-                ]
+        // bit_rate. Estimate it from the stream's own packet sizes instead
+        // of falling back to the container-level bitrate, which is the
+        // video+audio+subtitles total -- see T1.3.
+        if videoBitrate == nil, let streamIndex = intValue(primaryVideo["index"]) {
+            videoBitrate = await estimateVideoBitrateFromPackets(
+                url: url, ffprobePath: ffprobePath, streamIndex: streamIndex,
+                sampleWindowSeconds: min(30, duration)
             )
-            videoBitrate = Int(formatBitrateOutput?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        }
+
+        let allAudio = streams.filter { (stringValue($0["codec_type"]) ?? "") == "audio" }
+        let audioStreams = allAudio.enumerated().map { index, stream in
+            StreamTrack(
+                typeIndex: index, codec: stringValue(stream["codec_name"]) ?? "unknown",
+                language: tagValue(stream, "language"), title: tagValue(stream, "title")
+            )
+        }
+        let firstAudio = allAudio.first
+        let hasAudio = firstAudio != nil
+        let audioCodec = firstAudio.flatMap { stringValue($0["codec_name"]) }
+        let audioStreamDurationSeconds = firstAudio.flatMap { doubleValue($0["duration"]) }
+        let audioSampleRate = firstAudio.flatMap { intValue($0["sample_rate"]) }
+        let audioChannels = firstAudio.flatMap { intValue($0["channels"]) }
+
+        let allSubtitles = streams.filter { (stringValue($0["codec_type"]) ?? "") == "subtitle" }
+        let subtitleStreams = allSubtitles.enumerated().map { index, stream in
+            StreamTrack(
+                typeIndex: index, codec: stringValue(stream["codec_name"]) ?? "unknown",
+                language: tagValue(stream, "language"), title: tagValue(stream, "title")
+            )
         }
 
         return Info(
             durationSeconds: duration, hasAudio: hasAudio, width: width, height: height,
             videoCodec: videoCodec, videoBitrate: videoBitrate, audioCodec: audioCodec,
             videoStreamDurationSeconds: videoStreamDurationSeconds, audioStreamDurationSeconds: audioStreamDurationSeconds,
-            videoFrameRate: videoFrameRate, audioSampleRate: audioSampleRate, audioChannels: audioChannels
+            videoFrameRate: videoFrameRate, audioSampleRate: audioSampleRate, audioChannels: audioChannels,
+            pixFmt: pixFmt, audioStreams: audioStreams, subtitleStreams: subtitleStreams, hasChapters: hasChapters
         )
     }
 
-    /// Parses ffprobe's `default=noprint_wrappers=1` output (one `key=value`
-    /// per line) into a dictionary. Shared by both the audio- and video-stream
-    /// queries above, which ask for different fields but get the same shape back.
-    private static func parseKeyValueFields(_ output: String) -> [String: String] {
-        var fields: [String: String] = [:]
+    /// Falls back to computing the video stream's own average bitrate from
+    /// its packet sizes when the container doesn't declare one. Bounded to
+    /// a sample window from the start of the file rather than demuxing the
+    /// whole thing -- the same perf tradeoff `nearestKeyframeTimestamp`'s
+    /// `-read_intervals` bound makes in Clipper.swift, and for the same
+    /// reason (an unbounded packet listing was measured to effectively hang
+    /// on a real multi-minute recording). A bounded sample assumes roughly
+    /// constant bitrate; not exact for a highly variable-bitrate source, but
+    /// a meaningfully better estimate than the container-wide total, which
+    /// mixes in audio/subtitle bytes.
+    private static func estimateVideoBitrateFromPackets(url: URL, ffprobePath: String, streamIndex: Int, sampleWindowSeconds: Double) async -> Int? {
+        guard sampleWindowSeconds > 0 else { return nil }
+        guard let output = try? await run(
+            executable: ffprobePath,
+            arguments: [
+                "-v", "error",
+                "-select_streams", "\(streamIndex)",
+                "-read_intervals", "%\(sampleWindowSeconds)",
+                "-show_entries", "packet=size,pts_time",
+                "-of", "csv=p=0",
+                url.path,
+            ]
+        ) else { return nil }
+
+        // ffprobe's csv writer always emits packet fields in its own fixed
+        // order (pts_time, then size) -- verified empirically that it
+        // ignores the order given to -show_entries above, which had these
+        // two swapped in an earlier version of this function and silently
+        // parsed every line as unparseable (Int("0.13...") fails on the
+        // decimal point), making the estimate never fire for the MKVs it
+        // exists to fix.
+        var totalBytes = 0
+        var minPts: Double?
+        var maxPts: Double?
         for line in output.split(separator: "\n") {
-            let parts = line.split(separator: "=", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            fields[String(parts[0])] = String(parts[1])
+            let fields = line.split(separator: ",")
+            guard fields.count == 2, let size = Int(fields[1]) else { continue }
+            totalBytes += size
+            if let pts = Double(fields[0]) {
+                minPts = min(minPts ?? pts, pts)
+                maxPts = max(maxPts ?? pts, pts)
+            }
         }
-        return fields
+        guard totalBytes > 0, let minPts, let maxPts, maxPts > minPts else { return nil }
+        return Int(Double(totalBytes) * 8 / (maxPts - minPts))
+    }
+
+    private static func isAttachedPic(_ stream: [String: Any]) -> Bool {
+        guard let disposition = stream["disposition"] as? [String: Any] else { return false }
+        return intValue(disposition["attached_pic"]) == 1
+    }
+
+    private static func tagValue(_ stream: [String: Any], _ key: String) -> String? {
+        (stream["tags"] as? [String: Any])?[key] as? String
+    }
+
+    /// ffprobe's JSON writer doesn't consistently emit every field as the
+    /// same JSON type across ffmpeg versions/fields (e.g. `bit_rate` and
+    /// `duration` often come back as JSON strings rather than numbers,
+    /// since they can also be "N/A"). These three accept whatever came
+    /// back and coerce it, rather than assuming one representation.
+    private static func stringValue(_ any: Any?) -> String? {
+        if let s = any as? String { return s }
+        if let n = any as? NSNumber { return n.stringValue }
+        return nil
+    }
+
+    private static func intValue(_ any: Any?) -> Int? {
+        if let n = any as? Int { return n }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String { return Int(s) }
+        return nil
+    }
+
+    private static func doubleValue(_ any: Any?) -> Double? {
+        if let n = any as? Double { return n }
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s) }
+        return nil
     }
 
     /// ffprobe's `r_frame_rate` is a fraction string like "30/1" or "30000/1001".
@@ -187,11 +317,15 @@ enum VideoProbe {
             durationSeconds: duration, hasAudio: hasAudio, width: width, height: height,
             videoCodec: videoCodec, videoBitrate: videoBitrate, audioCodec: audioCodec,
             videoStreamDurationSeconds: nil, audioStreamDurationSeconds: nil,
-            // ffmpeg's stderr banner doesn't reliably expose these in a form
-            // worth parsing (this fallback path only runs when ffprobe is
-            // entirely unavailable, an already-rare case) -- the merge
-            // compatibility check simply skips files missing these values.
-            videoFrameRate: nil, audioSampleRate: nil, audioChannels: nil
+            // ffmpeg's stderr banner doesn't reliably expose these (or full
+            // per-track/chapter detail) in a form worth parsing -- this
+            // fallback path only runs when ffprobe is entirely unavailable,
+            // an already-rare case. Callers that need the track lists or
+            // pixFmt (T1.5's bit-depth guard, Tier 3's track picker) simply
+            // see nil/empty here and degrade to "no extra tracks known"
+            // rather than crashing.
+            videoFrameRate: nil, audioSampleRate: nil, audioChannels: nil,
+            pixFmt: nil, audioStreams: [], subtitleStreams: [], hasChapters: false
         )
     }
 

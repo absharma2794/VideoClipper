@@ -20,6 +20,12 @@ struct DropZoneView: View {
 
     var body: some View {
         VStack(spacing: 16) {
+            // Equal `Spacer`s above and below a naturally-sized content
+            // block -- the same reliable centering technique every other
+            // page in the app uses, rather than the manual `.offset(y:)`
+            // this used to have, which only looked centered by coincidence
+            // for whatever content happened to be below it at the time.
+            Spacer(minLength: 0)
             VStack(spacing: 16) {
                 Image(systemName: "film")
                     .font(.system(size: 44))
@@ -33,16 +39,16 @@ struct DropZoneView: View {
                     .foregroundStyle(.secondary)
 
                 Button("Choose File…", action: presentOpenPanel)
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.capsule)
 
                 Button("I know you have a .mp4 file", action: presentOpenPanel)
                     .buttonStyle(.link)
             }
-            .offset(y: 50)
+            Spacer(minLength: 0)
 
-            if let onQueueRequested {
-                Spacer()
+            if queueCount > 0, let onQueueRequested {
                 QueueBubble(count: queueCount, isRunning: queueIsRunning, onTap: onQueueRequested)
+                    .padding(.bottom, 8)
             }
 
             if let rejectionMessage {

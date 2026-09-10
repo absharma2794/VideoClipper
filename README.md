@@ -65,33 +65,79 @@ xattr -dr com.apple.quarantine MKVClipper.app
    - **Mode** — choose **Single Clip** (one clip) or **Bulk Clip** (many
      equal-length clips, see below).
    - **Clip Range** (or **Range to Split** in Bulk Clip) — type a **Start**
-     and **End** time as `HH:MM:SS`; the total duration is shown automatically.
-   - **Advanced Settings** — output format (MKV/MP4), Fast vs. Precise (or
-     Quality/Resolution in Bulk Clip — see below).
+     and **End** time as `HH:MM:SS`; the total duration is shown
+     automatically, alongside a live preview frame at each of Start and End
+     so you can see what you're actually cutting before you export.
+   - **Advanced Settings** — output format (MKV/MP4), Lossless vs. Precise
+     (or Quality/Resolution in Bulk Clip — see below), which audio/subtitle
+     tracks to keep, and an **ⓘ** summary of exactly what the export will do
+     — with a **Copy ffmpeg Command** button for the exact invocation.
 3. Hit **Export**. The clip lands in `~/Downloads/MKV Clipper Exports` and
    Finder can reveal it for you when it's done.
 
-### Fast vs. Precise cuts
+### Lossless vs. Precise cuts
 
 | Mode | Speed | How it cuts |
 |---|---|---|
-| **Fast** (default) | Near-instant | Copies the original video/audio streams without re-encoding. Lossless, but the actual start point snaps to the nearest keyframe — on typical recordings (e.g. OBS) that can be up to a few seconds off from what you typed. |
-| **Precise** (checkbox) | Slower | Re-encodes so the start and end land exactly where you typed them. Takes noticeably longer on long clips. |
+| **Lossless** | Near-instant | Copies the original video/audio/subtitle streams without re-encoding — bit-identical to the source. The actual start point snaps to the nearest keyframe, though — on typical recordings (e.g. OBS) that can be up to a few seconds off from what you typed. The Advanced Settings summary panel shows the real snapped start before you export. |
+| **Precise** (default) | Slower | Re-encodes so the start and end land exactly where you typed them. Takes noticeably longer on long clips — see Quality below for the tradeoffs this involves. |
 
-Turn on **Precise cut** when the exact frame matters; leave it off for
-quick, lossless trims.
+**Precise cut** is checked by default; uncheck it for quick, lossless trims
+when the exact frame doesn't matter.
 
-### Precise mode: Quality and Resolution
+### Precise mode: Quality, Encoder, and Resolution
 
-Turning on **Precise cut** reveals two more choices:
+Turning on **Precise cut** reveals a few more choices. Every tier re-encodes
+to HEVC (H.265) at a fixed constant-quality target, chosen so a shorter clip
+just costs proportionally less — the same way a lossless copy already
+behaves, rather than targeting a whole-file average bitrate (which doesn't
+have a well-defined right answer for an arbitrary-length clip):
 
 | Quality | What it does |
 |---|---|
-| **Smaller** | Re-encodes with hardware-accelerated HEVC (H.265). Dramatically smaller files (often ~5–7x smaller than H.264) at comparable visual quality, same resolution, similar speed — thanks to your Mac's dedicated video encoder. |
-| **Same Quality** | Matches the source's own codec family and bitrate as closely as possible, so a shorter clip comes out proportionally smaller — the way you'd expect "clipping" to behave. |
-| **Highest Quality** | Always re-encodes to H.264 at a fixed high-quality setting. Prioritizes precision/quality over file size — expect the largest files here, sometimes larger than the source. |
+| **Compact** | Meaningfully smaller files, at the cost of some visible quality — the lowest-quality option of the three. |
+| **High Quality** | The default balance of size and quality — visually near-indistinguishable from the source in testing, with real margin. |
+| **Highest Quality** | Effectively transparent, largest files of the three. Can exceed the source's own size. |
+
+**Encoder** (checkbox, default off):
+
+| | Speed & power | Compression |
+|---|---|---|
+| **Hardware** (default) | Near-instant, negligible battery — runs on Apple Silicon's dedicated video-encoding chip | Good |
+| **Software** (`Use software encoder`) | Roughly 10× slower, pins every CPU core for the whole run, heavy battery drain | Better — a re-encode is much more likely to come out smaller than the source |
+
+Leave it on **Hardware** for everyday use, especially on battery or for
+long clips. Turn on **Software** when the machine is plugged in, the clip is
+worth the wait, and you want the smallest file — or when a 10-bit source
+needs its bit depth preserved (the hardware encoder can't always do 10-bit).
+
+Every Precise export also carries through the source's chapters and global
+metadata, and (on the software encoder) preserves 10-bit color depth rather
+than silently dropping to 8-bit — failing loudly instead if the hardware
+encoder can't produce 10-bit output on your Mac.
 
 **Resolution** lets you optionally downscale (never upscale — that only wastes space, it doesn't add real detail) to 540p/720p/1080p/1440p/4K, shown alongside the source's actual resolution. Leave it on **Native** to keep the original pixel dimensions.
+
+### Choosing audio and subtitle tracks
+
+For a Single Clip Precise export, the **ⓘ** summary on Advanced Settings
+lists every audio and subtitle track the source has (language, codec, and
+title where available) with a checkbox next to each. The default selection
+is one audio track matching your Mac's system language (or the first track,
+if none match) with subtitles off — not "every track," which would carry
+along tracks nobody asked for on a source with many of them, and not "first
+track only," which would silently miss the one a non-English speaker
+actually wants.
+
+Exporting to MP4 can only carry text-based subtitle formats (it converts
+them to `mov_text`); an image-based subtitle track (e.g. PGS/VobSub, common
+on Blu-ray rips) can't convert and is left out of an MP4 export specifically
+— MKV output keeps it. Either way, a dropped track is always reported in
+the completed-export note, never left out silently.
+
+Lossless exports and Bulk Clip both keep their own fixed track behavior
+(everything, and one default-language audio track respectively) — the
+checklist only applies to a Single Clip Precise export.
 
 ### Bulk Clip: splitting into equal-length clips
 
@@ -105,10 +151,10 @@ many fixed-length clips automatically — e.g. a 1-hour video into
   clips`, updating as you type. If the range doesn't divide evenly, the last
   clip is shorter and the preview says so (`→ 3 clips (last clip: 5s)`).
 - Split mode always re-encodes with frame-exact boundaries — consecutive
-  clips tile the source with zero gaps or duplicated frames. (Fast/Precise
-  isn't a choice here: Fast mode's keyframe-snapped start, fine for one clip,
-  would misalign every clip boundary in a batch.) Quality and Resolution
-  work the same as in Precise mode above.
+  clips tile the source with zero gaps or duplicated frames. (Lossless/Precise
+  isn't a choice here: Lossless mode's keyframe-snapped start, fine for one
+  clip, would misalign every clip boundary in a batch.) Quality and
+  Resolution work the same as in Precise mode above.
 - **Buffer (seconds)** is optional and defaults to `0`. When set, every clip
   *except the first* starts that many seconds earlier than its exact
   boundary, so consecutive clips overlap slightly instead of cutting apart
@@ -133,7 +179,7 @@ sits next to **Export**. Use it instead of Export to line up several exports
 — e.g. the same file at 1080p and again at 720p, or a different range each
 time — without waiting for one to finish before configuring the next.
 
-- Up to 10 exports at a time (1 running + 9 waiting); they run strictly one
+- Up to 20 exports at a time (1 running + 19 waiting); they run strictly one
   after another, never in parallel, so quality and thermal behavior are
   identical to a direct Export.
 - A small pill showing how many are queued appears on every page once
@@ -176,9 +222,14 @@ Sources/
                            views, and the queue-count pill, shared across
                            the wizard and the queue screen
   Clipper.swift            Single-file clip/split export logic, ffmpeg process
-                           orchestration, output-path/folder naming
+                           orchestration, output-path/folder naming, and the
+                           pre-export summary/ffmpeg-command preview
   VideoProbe.swift          ffprobe-based metadata probing (duration, codecs,
-                           resolution, frame rate, sample rate, …)
+                           resolution, frame rate, sample rate, bit depth,
+                           every audio/subtitle track, chapters, …)
+  FrameThumbnailer.swift    Decodes a single preview frame at a given
+                           timestamp, for the Range Settings page's live
+                           Start/End thumbnails
   FFmpegLocator.swift       Finds the user's ffmpeg/ffprobe install
   FFmpegSetupView.swift     "Install ffmpeg" screen shown when it's missing
   Timecode.swift            HH:MM:SS formatting/parsing helpers

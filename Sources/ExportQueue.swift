@@ -74,11 +74,11 @@ final class ExportQueue: ObservableObject {
     static let shared = ExportQueue()
     private init() {}
 
-    /// "1 running + 9 queued", counted against active (queued/running) jobs
+    /// "1 running + 19 queued", counted against active (queued/running) jobs
     /// only -- finished/failed/cancelled rows stay visible as history until
     /// cleared, but never block new work. A lifetime cap would make the
-    /// queue useless after ten exports in a single session.
-    static let maxActiveJobs = 10
+    /// queue useless after twenty exports in a single session.
+    static let maxActiveJobs = 20
 
     @Published private(set) var jobs: [ExportJob] = []
 

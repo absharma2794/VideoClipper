@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// The Export Queue screen: up to 10 jobs (1 running + 9 waiting), reachable
-/// from the badge `ContentView` overlays on every other screen. Accordion-
-/// style: tapping a Running or Done row's filename/status line expands it
+/// The Export Queue screen: up to 20 jobs (1 running + 19 waiting), reachable
+/// from the `QueueBubble` docked into every other screen's own layout.
+/// Accordion-style: tapping a Running or Done row's filename/status line expands it
 /// into a bigger detail card right in its own place in the list -- not
 /// pulled out to a fixed slot at the top -- so a finished job sorted near
 /// the bottom expands there too, not back at the top where you'd have to
@@ -34,7 +34,7 @@ struct ExportQueueView: View {
                 Text("Export Queue").font(.headline)
                 Spacer()
                 Button("Clear Queue", role: .destructive) { queue.clearQueue() }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.capsule)
                     .controlSize(.small)
                     .disabled(!canClear)
             }

@@ -7,6 +7,75 @@ import SwiftUI
 /// rolling its own copy. Centralizing them here means a design change to
 /// any of these only needs to happen once.
 
+/// The pill-shaped button style every labeled button in the app uses --
+/// explicitly drawing a `Capsule()` (the same shape `QueueBubble` already
+/// uses) rather than relying on the system `.bordered`/`.borderedProminent`
+/// styles' own corner rounding, which varies by control size and macOS
+/// version instead of reliably reading as a full capsule at every size this
+/// app uses. Reads `configuration.role` so a `role: .destructive` button
+/// (Force Stop, Clear Queue) renders red automatically, without every call
+/// site needing its own `.tint(.red)`.
+struct CapsuleButtonStyle: ButtonStyle {
+    var prominent: Bool = false
+
+    @Environment(\.controlSize) private var controlSize
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(font)
+            .padding(.horizontal, horizontalPadding)
+            .frame(height: height)
+            .background(Capsule().fill(fillColor(configuration)))
+            .foregroundStyle(foregroundColor(configuration))
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .contentShape(Capsule())
+    }
+
+    private var height: CGFloat {
+        switch controlSize {
+        case .mini: return 20
+        case .small: return 24
+        case .large: return 34
+        default: return 28
+        }
+    }
+
+    private var horizontalPadding: CGFloat {
+        switch controlSize {
+        case .mini: return 8
+        case .small: return 10
+        case .large: return 18
+        default: return 14
+        }
+    }
+
+    private var font: Font {
+        switch controlSize {
+        case .mini, .small: return .caption
+        case .large: return .body
+        default: return .callout
+        }
+    }
+
+    private func fillColor(_ configuration: Configuration) -> Color {
+        guard isEnabled else { return Color.gray.opacity(0.12) }
+        if configuration.role == .destructive { return .red }
+        return prominent ? Color.accentColor : Color.gray.opacity(0.28)
+    }
+
+    private func foregroundColor(_ configuration: Configuration) -> Color {
+        guard isEnabled else { return .secondary }
+        if configuration.role == .destructive { return .white }
+        return prominent ? .white : .primary
+    }
+}
+
+extension ButtonStyle where Self == CapsuleButtonStyle {
+    static var capsule: CapsuleButtonStyle { CapsuleButtonStyle() }
+    static var capsuleProminent: CapsuleButtonStyle { CapsuleButtonStyle(prominent: true) }
+}
+
 /// The asymmetric slide transition used for pushing/popping wizard pages:
 /// new content enters from the trailing edge and exits toward the leading
 /// edge when moving forward, reversed when going back.
@@ -68,8 +137,7 @@ struct WizardProgressPage<Counter: View>: View {
                 .frame(maxWidth: 260)
                 .padding(.bottom, 20)
             Button("Force Stop", role: .destructive, action: onForceStop)
-                .buttonStyle(.bordered)
-                .tint(.red)
+                .buttonStyle(.capsule)
         }
     }
 }
@@ -115,9 +183,9 @@ struct WizardCompletedPage: View {
             }
             HStack(spacing: 10) {
                 Button("Reveal in Finder", action: onReveal)
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.capsule)
                 Button("Done", action: onDone)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.capsuleProminent)
             }
             .padding(.top, 6)
             if let secondaryActionLabel, let onSecondaryAction {
@@ -151,7 +219,7 @@ struct WizardStoppedPage: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             Button("Go Back", action: onGoBack)
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.capsuleProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
