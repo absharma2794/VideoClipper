@@ -74,12 +74,15 @@ struct EditorView: View {
     @State private var useSoftwareEncoder = false
 
     // Tier 3: which audio/subtitle tracks a Precise export maps, editable
-    // via the checklist in the export summary popover. Seeded in `init`
-    // below to `Clipper.defaultTrackSelection`'s "one track matching
-    // system language, subtitles off" -- or, when reopened via "Export
-    // Another Version of This File", to that job's own exact selection.
+    // via the checklist in the export summary popover. Audio is seeded in
+    // `init` below to `Clipper.defaultTrackSelection`'s "one track matching
+    // system language" -- or, when reopened via "Export Another Version of
+    // This File", to that job's own exact selection. Subtitles are
+    // `selectedSubtitleTracks` (computed, below), backed by this override.
     @State private var selectedAudioTracks: Set<Int>
-    @State private var selectedSubtitleTracks: Set<Int>
+    // nil = auto (see `selectedSubtitleTracks`); set by a manual tick/untick
+    // in the checklist, or by a reopened job's own exact selection.
+    @State private var subtitleOverride: Set<Int>? = nil
 
     @State private var intervalDigits = "30"
     @State private var intervalUnit: IntervalUnit = .seconds
@@ -125,19 +128,33 @@ struct EditorView: View {
             _qualityTier = State(initialValue: prefill.qualityTier)
             _resolution = State(initialValue: prefill.resolution)
             _selectedAudioTracks = State(initialValue: prefill.selectedAudioTracks)
-            _selectedSubtitleTracks = State(initialValue: prefill.selectedSubtitleTracks)
+            _subtitleOverride = State(initialValue: prefill.selectedSubtitleTracks)
             _useSoftwareEncoder = State(initialValue: prefill.useSoftwareEncoder)
             _page = State(initialValue: .rangeSettings)
         } else {
             _endDigits = State(initialValue: Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: ""))
             let defaults = Clipper.defaultTrackSelection(sourceInfo: info)
             _selectedAudioTracks = State(initialValue: defaults.audio)
-            _selectedSubtitleTracks = State(initialValue: defaults.subtitles)
         }
     }
 
     private var fullDurationDigits: String {
         Timecode.format(info.durationSeconds).replacingOccurrences(of: ":", with: "")
+    }
+
+    /// Start/End still at their defaults. Compared as digit strings, not
+    /// floats: the End field rounds the duration to whole seconds, so a
+    /// float compare would call a genuine end-to-end export "trimmed".
+    private var isFullRange: Bool { startDigits == "000000" && endDigits == fullDurationDigits }
+
+    /// Auto: every subtitle track for a full-length export, so re-encoding
+    /// for size never silently loses them; none once trimmed (as before).
+    /// A manual tick/untick, or a reopened job's own selection, lives in
+    /// `subtitleOverride` and always wins. Bulk Clip never reads this --
+    /// its request builder passes `[]` (see `previewRequest`).
+    private var selectedSubtitleTracks: Set<Int> {
+        get { subtitleOverride ?? (isFullRange ? Set(info.subtitleStreams.map(\.typeIndex)) : []) }
+        nonmutating set { subtitleOverride = newValue }
     }
 
     private var parsedStart: Double? { Self.seconds(fromDigits: startDigits) }
